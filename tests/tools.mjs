@@ -466,6 +466,18 @@ try {
     }
   }
 
+  console.log('17) browser_attach is wired and explains a dead endpoint');
+  try {
+    await call('browser_attach', { url: 'http://127.0.0.1:9' });
+    fail('attach to a dead endpoint', 'it resolved instead of throwing');
+  } catch (error) {
+    if (/Nothing answers DevTools/.test(error.message)) ok('a dead endpoint is explained', error.message.split('.')[0].slice(0, 60));
+    else fail('attach error', error.message);
+  }
+  const detached = await call('browser_attach', { detach: true });
+  if (/Let go of|never attached/.test(detached.text)) ok('detach is wired', detached.text.split('\n')[0].slice(0, 70));
+  else fail('detach', detached.text.split('\n')[0]);
+
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
   if (failures > 0) process.exitCode = 1;
 } catch (error) {

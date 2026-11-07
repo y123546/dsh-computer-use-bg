@@ -59,6 +59,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     dialogBehavior: accept  # accept | dismiss —— alert/confirm/prompt 怎么自动应答
     dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
     followNewTabs: true     # 点击开出来的新标签页（target=_blank / OAuth 弹窗）自动跟过去
+    attachUrl: ''         # 设了就默认接管这个 DevTools 端点，而不是自己起浏览器（如 http://127.0.0.1:9333）
     desktop: true         # 桌面平面（原生窗口）总开关；需要 Python 3
     pythonPath: ''        # 留空自动找：DSH 自带的 python → python → python3 → py -3
     desktopIsolated: true # desktop_launch 默认把程序放到隔离桌面（看不见、抢不到焦点）
@@ -88,7 +89,8 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_hover` | 悬停后告诉模型**新出现了什么**（下拉菜单、tooltip），并给这些新元素的 `ref`，接着就能点 |
 | `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
 | `browser_screenshot` | 只截一个元素或一块区域。比整屏省一个量级的图片 token，看小字还可以 `scale: 2` |
-| `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
+| `browser_attach` | 接管**已经在运行**的应用（DSH 自己、Chrome、VS Code…）：用它的 DevTools 端口，不需要 token |
+| `browser_close` | 关掉私有浏览器（profile 保留，下次复用）；接管模式下调它只是松手，不会关掉那个应用 |
 | `desktop_windows` | 列出**原生窗口**：自己的桌面 + 本插件开的隔离桌面，带进程、pid、尺寸 |
 | `desktop_tree` | 读一个原生窗口里的控件（按钮、输入框、列表、标签），给它们 id 供后续操作 |
 | `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。不移动真实鼠标、不抢焦点 |
@@ -134,6 +136,33 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 也就是点完就知道，不用额外调用。要看全量、或等大文件下完，用 `browser_download`（`wait: true` 会阻塞到传输结束）。同名下载**不会互相覆盖**：第二份叫 `report (1).csv`。
 
 默认不写系统「下载」文件夹是有意的：那是用户的目录，插件不经允许不该往里放东西；想把 `downloadDir` 指到那里随时可以。
+
+## 自绘窗口（Electron）：为什么桌面平面看不见控件
+
+DSH、VS Code、Slack、微信桌面版这类应用的整个界面是 Chromium 自己画出来的。在 Win32 眼里
+它只有**一个顶层窗口**，没有子控件——所以 `desktop_tree` 会如实回答"这个窗口自己画，没有子控件"。
+**这不是故障，是 Electron 的形态**，任何靠枚举子窗口的办法都看不到里面的按钮。
+
+更麻烦的是：对 Chromium 窗口，连"按坐标 posted 一个点击"也没用——它只认真实输入。
+
+正确的办法是 `browser_attach`：这类应用只要带 `--remote-debugging-port` 启动，DevTools 就能看到
+**每一个 DOM 元素**。DSH 本来就是这么启动的（`StartDSH.bat` 第 36 行，端口 9333，**不需要 token**）：
+
+```text
+browser_attach                 # 默认就连 DSH 自己的 9333
+browser_snapshot               # 现在拿到的是应用界面的元素清单
+browser_click { "ref": 12 }    # 按元素点，不猜坐标
+browser_close                  # 只是松手，DSH 不会被关掉
+```
+
+接管模式对你那个应用的承诺，条条有测试盯着：
+
+- **不新建标签页**（不然会凭空多一个窗口）；
+- **不改窗口尺寸**（`Emulation.setDeviceMetricsOverride` 在接管时被跳过，否则你的布局会被改掉）；
+- **不动下载**（否则你的下载会被导进插件的目录）；
+- **不关进程**：`shutdown()` 只关自己的 socket；`browser_close` 等于放手。
+
+代价是它驱动的是**你正在看的那个窗口**——同一个界面，操作会互相看见。要互不干扰，还是走私有浏览器。
 
 ## 桌面平面（原生窗口）
 
@@ -241,6 +270,7 @@ live（真实网站）
 - [x] **桌面平面（v1）**：`desktop_windows` / `desktop_tree` / `desktop_act` / `desktop_shot` / `desktop_launch`；隔离桌面（`CreateDesktopW` + 桌内 worker）里枚举、绘制、发消息，不抢前台
 - [ ] **桌面平面 v2（UIA）**：`UIAutomationClient` 能给出现代应用的语义树（Word 的段落、微信的会话列表），比 Win32 子窗口枚举强得多。这一版没做是因为开发环境里 .NET 动态加载被拦，无法验证
 - [ ] 桌面平面的**真实输入**可选模式（`SendInput` + 主动抢前台），给那些忽略 posted 消息的应用
+- [x] **`browser_attach`**：接管已经在运行的 Chromium/Electron（DSH 自己的界面就是这样被驱动的），不新建标签页、不改尺寸、不关进程
 - [ ] 跨域 iframe 里的 `browser_eval`（现在只在主文档执行）
 
 ## 开发
@@ -323,6 +353,14 @@ tests/          端到端验证
 28. **`behavior: "allow"` 会静默覆盖同名文件。** 这一点和日常浏览器的「下载」文件夹不一样：连点两次「导出 CSV」，磁盘上只剩一份，前一份数据被替换掉而且没有任何提示。改用 `allowAndName`（按 guid 存，绝不撞名），完成后再自己 `rename` 成 `report.csv` / `report (1).csv`。
 29. **`downloadProgress` 的 `completed` 早于最终改名几毫秒。** 收到就去找文件会扑空（`existsSync` 为 false，看起来像"文件没下下来"）。所以路径解析是**惰性**的：拿不到就留空，下次读再试；`waitForDownloads` 在收尾时额外给 800ms 重试窗口。
 30. **`allowAndName` 的文件名是 guid，`suggestedFilename` 只在事件里。** 协议从不告诉你最终绝对路径，所以「名字 → 路径」这一步只能自己做。反过来这也意味着：**文件名来自 HTTP 响应头**，写盘前必须自己清洗 `\ / : * ? " < > |`，不能当成可信输入。
+
+31. **接管别人的浏览器，有四件事一件都不能做**：`PUT /json/new`（会凭空给人开一个窗口）、
+    `Emulation.setDeviceMetricsOverride`（会把用户正在看的布局改小，坐标和截图从此对不上）、
+    `Browser.setDownloadBehavior`（会把用户的下载导进插件目录）、`GET /json/close`
+    （那是**关掉整个浏览器**，不是关连接）。最后一条最要命：它就在 `shutdown()` 里，
+    而空闲回收也会走到 `shutdown()` —— 少了 `if (this.foreign) return;`，一次 5 分钟空闲
+    就能把用户开着的 DSH 关掉。`tests/attach.mjs` 里专门有一步在 `shutdown()` 之后检查
+    "那个浏览器还活着吗"。
 
 ## License
 
