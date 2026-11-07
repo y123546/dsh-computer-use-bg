@@ -55,6 +55,8 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     browserPath: ''       # 留空自动探测 Edge/Chrome
     profileDir: ''        # 留空用 <DSH_HOME>/dsh-computer-use-bg/profile
     timeoutMs: 25000      # 冷启动等待上限
+    dialogBehavior: accept  # accept | dismiss —— alert/confirm/prompt 怎么自动应答
+    dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
     enabled: true         # false = 一个工具都不注册（硬开关）
 ```
 
@@ -71,9 +73,14 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_scroll` | 滚动视口 |
 | `browser_text` | 把页面读成纯文本（比截图省 token） |
 | `browser_eval` | 在页面里跑 JS，读结构化数据（表格、内嵌 JSON） |
+| `browser_wait` | 等条件成立：元素出现 / 文字出现 / 元素消失 / 加载完成。比固定 sleep 稳，超时会告诉你页面实际长什么样 |
+| `browser_nav` | 前进 / 后退 / 刷新。到边界会明确报错，不会假装成功 |
+| `browser_upload` | 给 `<input type="file">` 塞本地文件，不弹系统选择框（输入框是隐藏的也能塞） |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
+
+`alert` / `confirm` / `prompt` 会**自动应答**（默认 accept），否则渲染器会卡死、后面每条命令都超时。被应答的对话框会附在下一次工具结果的末尾，例如 `(dialog handled automatically: confirm("sure?") — accepted)` —— 不会悄悄吞掉。要改成 dismiss，见下面的 `dialogBehavior`。
 
 ## 验证
 
@@ -125,10 +132,17 @@ live（真实网站）
 
 ## Roadmap
 
+- [x] **对话框**（`alert` / `confirm` / `prompt`）：打开即自动应答并写进结果，页面不会再被卡死
+- [x] **`browser_wait`**：等元素 / 文字 / 消失 / 加载完成，替代固定 sleep
+- [x] **`browser_nav`**：reload / back / forward，到边界明确报错
+- [x] **`browser_upload`**：给隐藏的 `<input type="file">` 直接塞文件
 - [ ] **桌面平面**：UIA 控件树（文本，不用截图）+ 隔离桌面（`CreateDesktop`）里跑真实输入，让本地软件也能操作而不抢前台 —— 这是 `@copylee` / `windows-mcp` 那套做不到的
+- [ ] iframe / 跨域 frame：现在只能看到主框架，嵌入的支付、编辑器、验证码读不到
 - [ ] 多标签页管理（`Target.createTarget` + sessionId 复用）
+- [ ] hover / 右键菜单 / 拖拽
+- [ ] 下载落盘（`Browser.setDownloadBehavior`）
 - [ ] 元素截图裁剪（只发目标区域的图，省 token）
-- [ ] `browser_wait`：等元素出现 / 等导航完成，替代固定 sleep
+- [ ] 只接受 drag 事件的 drop zone（`Input.dispatchDragEvent`）
 
 ## 开发
 
