@@ -148,11 +148,14 @@ live（真实网站）
 
 ```bash
 node tests/load.mjs           # 离线：按 DSH 的严格契约复刻注册校验（改动后先跑这个）
+node tests/tools.mjs          # 工具接线：每个返回值都用自己的 output.schema 校验一遍
 node tests/idle.mjs           # 空闲回收：进程确实会退出
-node tests/smoke.mjs          # 本地页面端到端：点击、输入、键盘、截图
+node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/等待/对话框/上传/前进后退
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
 ```
+
+`tests/schema.mjs` 是宿主那两个 schema 校验器的唯一副本，`load.mjs` 和 `tools.mjs` 共用它。
 
 代码结构：
 
