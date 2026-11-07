@@ -4,7 +4,7 @@ import { BrowserHost } from '../lib/cdp.js';
 import { clickAt, evaluate, navigate, screenshot, snapshot } from '../lib/page.js';
 
 const url = process.argv[2] ?? 'https://example.com';
-const host = new BrowserHost({ port: 9336, headless: true, width: 1280, height: 800 });
+const host = new BrowserHost({ port: 9473, headless: true, width: 1280, height: 800 });
 
 try {
   const conn = await host.page();

@@ -41,7 +41,7 @@ const fail = (label, detail = '') => {
   console.log(`  FAIL  ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-const host = new BrowserHost({ port: 9333, headless: true, width: 1280, height: 800 });
+const host = new BrowserHost({ port: 9472, headless: true, width: 1280, height: 800 });
 
 try {
   console.log('1) start private browser');

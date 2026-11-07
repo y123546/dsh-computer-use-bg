@@ -1,7 +1,7 @@
 {
   "name": "dsh-computer-use-bg",
-  "version": "0.1.0",
-  "description": "Background computer use for DeepSeek Harness: drive a private Chromium over CDP without stealing your mouse, keyboard or focus.",
+  "version": "0.2.0",
+  "description": "Background computer use for DeepSeek Harness: drive a private Chromium over CDP with no window, no stolen mouse, no stolen keyboard.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

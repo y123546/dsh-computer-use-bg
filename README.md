@@ -15,9 +15,12 @@
 | 定位方式 | 截图 + 像素坐标 | DOM / 无障碍元素带 `ref` 编号 |
 | 输入方式 | `SendInput` 真实鼠标键盘 | CDP `Input.dispatchMouseEvent` 在浏览器内合成 |
 | 占用前台 | 是（会抢焦点） | 否 |
+| **是否弹窗口** | 会（占你的桌面） | **不弹**：默认无窗口运行，只在截图里看到画面 |
 | 你在干嘛 | 必须停下来 | 照常用电脑 |
 | 换分辨率/缩放 | 点偏了要重算 | 无关（不用像素猜） |
 | 本地软件 GUI | 能 | **暂不支持**（见 Roadmap） |
+
+默认 `headless: true`，浏览器进程在后台跑，屏幕上不会多出任何窗口；任务结束空闲 5 分钟后进程自动退出，不留残余。想看它到底在点什么，把 `headless` 改成 `false` 就会弹出这个独立窗口（仍然不抢你正在用的浏览器）。
 
 ## 安装
 
@@ -45,7 +48,8 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 - id: bg-computer-use
   config:
     port: 9411            # CDP 端口；被占用会自动往后找空端口
-    headless: false       # true = 完全无窗口
+    headless: true        # 默认 true = 完全无窗口；改成 false 才会弹出可见窗口
+    idleMs: 300000        # 空闲多久自动关掉浏览器（0 = 不自动关）
     width: 1440           # 视口宽（截图与坐标 1:1）
     height: 900
     browserPath: ''       # 留空自动探测 Edge/Chrome
@@ -98,6 +102,15 @@ smoke（本地页面，连跑 3 次）：3/3 全部通过
 live（真实网站）
   https://example.com    navigate 1477ms，元素 1 个
                          点击 "Learn more" → 跳转 iana.org ✓
+
+窗口行为（默认配置，走插件真实入口 apply/execute）
+  plugin 起的 8 个 Edge 进程   MainWindowHandle 全部 = 0，窗口标题全为空
+  用户自己开的 10 个 Edge 进程  完好未受影响
+  结论                          屏幕上零新增窗口
+
+空闲回收（idleMs = 2500ms）
+  用完当下                    子进程存活
+  4 秒后                      进程已退出，host.child = null
 ```
 
 ## 已知边界
@@ -105,7 +118,9 @@ live（真实网站）
 - **只覆盖浏览器里的东西。** 本地软件的窗口和控件不在这一版范围内，那是桌面平面的活（见 Roadmap）。
 - **私有 profile 是全新的。** 它没有你日常浏览器的 cookie 和登录态，需要登录的站点得在它里面登一次；登录态会保存在 `<DSH_HOME>/dsh-computer-use-bg/profile`，下次复用。
 - **CDP 端口是本机回环。** 默认只监听 `127.0.0.1`。要远程用，别直接暴露，走 SSH 隧道。
-- **`--headless` 下部分站点会识别出无头浏览器。** 默认有头（窗口独立，不干扰你）。
+- **`--headless` 下部分站点会识别出无头浏览器。** 默认就是无窗口，遇到硬性反爬的站点可临时把 `headless` 设成 `false` 再试一次。
+- **无窗口就意味着你看不到过程。** 想确认它点了哪儿，用 `browser_screenshot`；想全程盯着看，把 `headless` 改成 `false`。
+- **空闲会自动关闭。** 默认 5 分钟无操作后杀掉浏览器进程，下次调用重新拉起（冷启动约 7 秒）。要常驻就把 `idleMs` 设成 `0`。
 - **`browser_eval` 能执行任意 JS。** 只在你信任的页面上用。
 
 ## Roadmap
