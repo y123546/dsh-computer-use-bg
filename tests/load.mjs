@@ -23,6 +23,133 @@ function check(label, ok, detail = '') {
   }
 }
 
+// --- host schema rules, ported from @deepseek-ai/dsh-tools -------------------
+// assertSupportedJsonSchema: the subset the host accepts at register time.
+// validateJsonSchemaValue: the same schema checked against what a tool returns.
+const CONSTRAINT_KEYWORDS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const']);
+const ANNOTATION_KEYWORDS = new Set(['description', 'title', 'default', 'examples']);
+const SCHEMA_TYPES = ['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'];
+const ONE_OF_SIBLINGS = ['properties', 'required', 'additionalProperties', 'items', 'enum', 'const'];
+const KEYWORD_TYPES = {
+  properties: ['object'],
+  required: ['object'],
+  additionalProperties: ['object'],
+  items: ['array'],
+  enum: ['string', 'number', 'integer', 'boolean', 'null'],
+  const: ['string', 'number', 'integer', 'boolean', 'null'],
+};
+
+const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function assertSupportedJsonSchema(schema, path = 'schema', violations = []) {
+  if (!isRecord(schema)) {
+    violations.push(`${path} must be a schema object`);
+    return violations;
+  }
+  for (const key of Object.keys(schema)) {
+    if (CONSTRAINT_KEYWORDS.has(key) || ANNOTATION_KEYWORDS.has(key)) continue;
+    violations.push(`${path}.${key} is not a supported keyword`);
+  }
+  const hasType = Object.hasOwn(schema, 'type');
+  const hasOneOf = Object.hasOwn(schema, 'oneOf');
+  if (hasType && hasOneOf) {
+    violations.push(`${path} cannot declare both type and oneOf`);
+    return violations;
+  }
+  if (hasOneOf) {
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length < 2) violations.push(`${path}.oneOf must be an array of at least two schemas`);
+    else schema.oneOf.forEach((branch, i) => assertSupportedJsonSchema(branch, `${path}.oneOf[${i}]`, violations));
+    for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(schema, key)) violations.push(`${path}.${key} is not supported beside oneOf`);
+    return violations;
+  }
+  if (!hasType) {
+    for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(schema, key)) violations.push(`${path}.${key} requires type or oneOf`);
+    return violations;
+  }
+  if (typeof schema.type !== 'string' || !SCHEMA_TYPES.includes(schema.type)) {
+    violations.push(`${path}.type must be one of ${SCHEMA_TYPES.join('/')}`);
+    return violations;
+  }
+  const schemaType = schema.type;
+  for (const [key, types] of Object.entries(KEYWORD_TYPES)) {
+    if (Object.hasOwn(schema, key) && !types.includes(schemaType)) violations.push(`${path}.${key} is not supported on type "${schemaType}"`);
+  }
+  if (schemaType === 'object') {
+    const properties = Object.hasOwn(schema, 'properties') ? schema.properties : undefined;
+    if (Object.hasOwn(schema, 'properties') && !isRecord(properties)) violations.push(`${path}.properties must be an object of schemas`);
+    else if (properties) for (const [key, sub] of Object.entries(properties)) assertSupportedJsonSchema(sub, `${path}.properties.${key}`, violations);
+
+    if (Object.hasOwn(schema, 'required')) {
+      if (!Array.isArray(schema.required) || schema.required.some((entry) => typeof entry !== 'string')) {
+        violations.push(`${path}.required must be an array of strings`);
+      } else {
+        for (const key of schema.required) {
+          if (!Object.hasOwn(properties ?? {}, key)) violations.push(`${path}.required names "${key}" which is not in properties`);
+        }
+      }
+    }
+    if (Object.hasOwn(schema, 'additionalProperties') && typeof schema.additionalProperties !== 'boolean') {
+      violations.push(`${path}.additionalProperties must be a boolean`);
+    }
+  }
+  if (schemaType === 'array' && Object.hasOwn(schema, 'items')) assertSupportedJsonSchema(schema.items, `${path}.items`, violations);
+  return violations;
+}
+
+function validateJsonSchemaValue(schema, value, path = 'value', out = []) {
+  if (schema.oneOf !== undefined) {
+    const matches = schema.oneOf.filter((branch) => validateJsonSchemaValue(branch, value, path, []).length === 0).length;
+    if (matches !== 1) out.push(`"${path}" must match exactly one oneOf branch (matched ${matches})`);
+    return out;
+  }
+  switch (schema.type) {
+    case undefined:
+      return out;
+    case 'object': {
+      if (!isRecord(value)) {
+        out.push(`"${path}" must be an object`);
+        return out;
+      }
+      const properties = schema.properties ?? {};
+      for (const key of schema.required ?? []) {
+        if (!Object.hasOwn(value, key) || value[key] === undefined) out.push(`missing required property "${path}.${key}"`);
+      }
+      for (const [key, sub] of Object.entries(properties)) {
+        if (Object.hasOwn(value, key) && value[key] !== undefined) validateJsonSchemaValue(sub, value[key], `${path}.${key}`, out);
+      }
+      if (schema.additionalProperties === false) {
+        for (const key of Object.keys(value)) if (!Object.hasOwn(properties, key)) out.push(`"${path}.${key}" is not a declared property (additionalProperties: false)`);
+      }
+      return out;
+    }
+    case 'array': {
+      if (!Array.isArray(value)) {
+        out.push(`"${path}" must be an array`);
+        return out;
+      }
+      if (schema.items !== undefined) value.forEach((entry, i) => validateJsonSchemaValue(schema.items, entry, `${path}[${i}]`, out));
+      return out;
+    }
+    case 'string':
+      if (typeof value !== 'string') out.push(`"${path}" must be a string`);
+      return out;
+    case 'number':
+      if (typeof value !== 'number' || !Number.isFinite(value)) out.push(`"${path}" must be a finite JSON number`);
+      return out;
+    case 'integer':
+      if (typeof value !== 'number' || !Number.isInteger(value)) out.push(`"${path}" must be an integer`);
+      return out;
+    case 'boolean':
+      if (typeof value !== 'boolean') out.push(`"${path}" must be a boolean`);
+      return out;
+    case 'null':
+      if (value !== null) out.push(`"${path}" must be null`);
+      return out;
+    default:
+      return out;
+  }
+}
+
 function toolRegistry(sink = registered) {
   return {
     register(tool) {
@@ -42,6 +169,15 @@ function toolRegistry(sink = registered) {
       }
       if (!output.schema || typeof output.schema !== 'object') {
         throw new TypeError(`tool "${tool.name}" output.schema must be an object`);
+      }
+      // Second host check, and the one that cost a whole debugging session: the schema
+      // is raw JSON Schema run through `assertSupportedJsonSchema`, which knows only
+      // type/oneOf/properties/required/additionalProperties/items/enum/const plus
+      // annotations. `required: true` inside a property (the parameter-DSL spelling)
+      // is rejected and the plugin shows up as "异常" with no visible reason.
+      const schemaViolations = assertSupportedJsonSchema(output.schema);
+      if (schemaViolations.length > 0) {
+        throw new TypeError(`tool "${tool.name}" has an unsupported output.schema: ${schemaViolations.join('; ')}`);
       }
       if (tool.timeoutMs !== undefined && (!Number.isFinite(tool.timeoutMs) || tool.timeoutMs <= 0)) {
         throw new TypeError(`tool "${tool.name}" timeoutMs must be a positive finite number`);
@@ -127,7 +263,7 @@ check(
   Array.isArray(textOnly) && textOnly.length === 1 && textOnly[0].type === 'text' && textOnly[0].text === 'hello',
   JSON.stringify(textOnly),
 );
-const attachment = { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 2, height: 3 };
+const attachment = { attachmentId: 'sha256:abc', mediaType: 'image/png', bytes: 10, width: 2, height: 3, name: 'browser.png', originalDimensions: { width: 2, height: 3 } };
 const withImage = sample.output.render({}, { text: 'shot', image: attachment });
 check(
   'render returns text then image',
@@ -136,6 +272,28 @@ check(
     withImage[1].type === 'image' &&
     withImage[1].attachment === attachment,
   JSON.stringify(withImage),
+);
+
+// The host re-validates what a tool returns against output.schema, so the samples
+// above must pass that schema — a mismatch only surfaces at call time in DSH.
+const textViolations = validateJsonSchemaValue(sample.output.schema, { text: 'hello' });
+check('text output passes its own schema', textViolations.length === 0, textViolations.join('; '));
+const full = { text: 'shot', image: attachment };
+const fullViolations = validateJsonSchemaValue(sample.output.schema, full);
+check('text+image output passes its own schema', fullViolations.length === 0, fullViolations.join('; '));
+
+// And the guard has to actually bite: the parameter-DSL spelling must be rejected,
+// because that is exactly the shape that made the plugin show up as 异常.
+const dslSpelling = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { text: { type: 'string', required: true } },
+};
+const dslViolations = assertSupportedJsonSchema(dslSpelling);
+check(
+  'rejects required:true inside a property',
+  dslViolations.some((v) => v.includes('.properties.text.required')),
+  dslViolations.join('; ') || 'no violation reported',
 );
 
 const expected = [

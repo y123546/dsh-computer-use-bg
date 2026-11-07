@@ -133,6 +133,8 @@ live（真实网站）
 ## 开发
 
 ```bash
+node tests/load.mjs           # 离线：按 DSH 的严格契约复刻注册校验（改动后先跑这个）
+node tests/idle.mjs           # 空闲回收：进程确实会退出
 node tests/smoke.mjs          # 本地页面端到端：点击、输入、键盘、截图
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
@@ -165,6 +167,18 @@ tests/         端到端验证
    if (pkg.error !== undefined || pkg.enabled && pkg.rows.some(r => r.phase === "failed")) return "problem";
    ```
    `render(args, value)` 返回 content block 数组，截图要给 `{ type: 'image', attachment: ref }`；`output.schema` 是 `additionalProperties: false`，所以 attachment ref 必须白名单裁剪，多一个字段都会校验失败。`tests/load.mjs` 现在原样复刻了这套校验，本地就能拦住。
+9. **`output.schema` 是原始 JSON Schema，不是输入用的那套 DSL。** 上面第 8 条修完后插件还是「异常」，第二层诊断是：
+   ```
+   unsupported JSON schema: schema.properties.text.required is not supported on type "string";
+   schema.properties.image.properties.attachmentId.required is not supported on type "string"  (共 8 条)
+   ```
+   原因：`parameters`（输入）走 DSH 自己的 DSL，`{ type: 'string', required: true }` 里的 `required: true` 表示"这个字段必填"，由 `valueSchemaSpecToJsonSchema()` 转成标准 JSON Schema；而 `output.schema` **已经是**标准 JSON Schema，`required` 必须是 object 节点上的**数组**。照抄 `@copylee/dsh-computer-use` 的字面结构就会踩这一脚。
+   宿主的规则（`@deepseek-ai/dsh-tools/lib/shared-*.js` 里的 `assertSupportedJsonSchema`）：
+   - 只认 `type / oneOf / properties / required / additionalProperties / items / enum / const`，注解只认 `description / title / default / examples`；
+   - `properties|required|additionalProperties` 只能出现在 `type: "object"` 上，`items` 只能出现在 array 上；
+   - `required` 是字符串数组，且每个名字必须在 `properties` 里存在；
+   - `additionalProperties` 必须是显式 boolean；`type` 必须是单个字符串，不能是数组；`type` 和 `oneOf` 不能并存。
+10. **`output.schema` 同时是返回值校验器。** 不是只做语法检查：`pipeline.js` 里每次调用成功都会跑 `validateJsonSchemaValue(tool.output.schema, value)`，不过就抛 `ToolOutputError`。所以 schema 写得比真实返回值严（比如把 attachment 的可选字段全标成必填）会在**调用时**炸。本插件的写法是：顶层 `required: ['text']` + `additionalProperties: false`（形状可控），图片引用 `required: ['attachmentId']` + `additionalProperties: true`（存储层将来加展示字段也不会炸）。
 
 ## License
 
