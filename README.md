@@ -44,7 +44,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 ```yaml
 - id: bg-computer-use
   config:
-    port: 9333            # CDP 端口，被占用就换一个
+    port: 9411            # CDP 端口；被占用会自动往后找空端口
     headless: false       # true = 完全无窗口
     width: 1440           # 视口宽（截图与坐标 1:1）
     height: 900
@@ -138,6 +138,9 @@ tests/         端到端验证
 2. **输入事件要留间隔。** `mouseMoved → mousePressed → mouseReleased` 三连发太快，渲染器会丢掉 release，页面收不到 `click`。每步之间留 60ms。
 3. **导航刚完成时点击不可靠。** `Page.navigate` 返回不代表渲染器已经能接收合成输入，点击前要 settle。
 4. **后台化的 target 会静默丢弃输入。** 创建 target 后调一次 `Page.bringToFront`。
+5. **端口会被别的 Chromium 抢走，而它一样能应答。** DSH 自己就带 `--remote-debugging-port`（本机 `StartDSH.bat` 里是 9333）。旧版本只在启动前探一下端口：有东西应答就直接连上去，等于连到 **DSH 自己的 DevTools**，`browser_open` 会去导航应用窗口。现在改成：端口被占就往后找空端口，自己起浏览器，再用 `Browser.getBrowserCommandLine` 核对 `--user-data-dir` 是不是我们的 profile —— 认不上就杀掉重来，绝不碰别人的端点。端口默认值也因此从 9333 改成 **9411**。
+6. **全新 profile 的 target 会假握手。** 新建的 profile 首次启动时，渲染进程还在初始化，target 能连上却一条命令都不回。连上后必须做健康检查，失败就换新 target 重试（最多 4 次，每次间隔 700ms）。
+7. **别用浏览器级 socket + `Target.attachToTarget` 走会话。** 在这台 Edge 155 上，attach 之后渲染器直接 `Inspector.targetCrashed`，有头无头都一样。页面级 target 才稳。
 
 ## License
 
