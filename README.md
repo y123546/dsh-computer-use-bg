@@ -24,7 +24,9 @@
 ### 图形界面（推荐，Electron 的 `desktop` profile 只能这样装）
 
 1. 打开 **DSH → 设置 → 插件 → 添加插件**
-2. 填 `github:y123546/dsh-computer-use-bg`
+2. 填下面任意一种：
+   - 本地路径（最快，改代码后重启即生效）：`F:\dsh-pkgs\dsh-computer-use-bg`
+   - 仓库地址：`github:y123546/dsh-computer-use-bg`
 3. 重启 DSH
 
 ### 命令行（仅限非 `desktop` profile）
