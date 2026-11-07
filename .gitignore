@@ -2,3 +2,5 @@ node_modules/
 *.log
 .runtime/
 profile/
+__pycache__/
+*.pyc

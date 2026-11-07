@@ -59,6 +59,10 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     dialogBehavior: accept  # accept | dismiss —— alert/confirm/prompt 怎么自动应答
     dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
     followNewTabs: true     # 点击开出来的新标签页（target=_blank / OAuth 弹窗）自动跟过去
+    desktop: true         # 桌面平面（原生窗口）总开关；需要 Python 3
+    pythonPath: ''        # 留空自动找 python / python3 / py -3
+    desktopIsolated: true # desktop_launch 默认把程序放到隔离桌面（看不见、抢不到焦点）
+    shotDir: ''           # 留空用 <DSH_HOME>/dsh-computer-use-bg/shots
     enabled: true         # false = 一个工具都不注册（硬开关）
 ```
 
@@ -85,12 +89,19 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
 | `browser_screenshot` | 只截一个元素或一块区域。比整屏省一个量级的图片 token，看小字还可以 `scale: 2` |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
+| `desktop_windows` | 列出**原生窗口**：自己的桌面 + 本插件开的隔离桌面，带进程、pid、尺寸 |
+| `desktop_tree` | 读一个原生窗口里的控件（按钮、输入框、列表、标签），给它们 id 供后续操作 |
+| `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。不移动真实鼠标、不抢焦点 |
+| `desktop_shot` | 截一个原生窗口（客户区），窗口被遮住、最小化以外的情形都能画出来 |
+| `desktop_launch` | 启动一个本机程序，默认放进**隔离桌面**：正常运行，但窗口不出现在你屏幕上 |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
 
-**iframe（同源）**默认就会进去看，不需要额外参数：快照会遍历所有能读的子框架，里面的元素照常编号，行尾标一个 `(f0)` / `(f0.1)` 表示它属于哪个框架。坐标**已经换算到顶层视口**，所以 `browser_click` / `browser_type` / `browser_hover` 直接就能用；`browser_text` 会把子框架的文字也拼进来并标注 `[frame 0]`；`browser_wait` 的选择器同样能命中框架内部。
+**iframe**默认就会进去看，不管同源还是跨域，都不需要额外参数：快照会遍历所有能读的子框架，里面的元素照常编号，行尾标 `(f0)` / `(f0.1)` / `(fx0)` 表示它属于哪个框架（`x` 开头的是**独立进程**里的框架）。坐标**已经换算到顶层视口**，所以 `browser_click` / `browser_type` / `browser_hover` 直接就能用；`browser_text` 会把子框架的文字也拼进来并标注 `[frame 0]`；`browser_wait` 的选择器同样能命中框架内部（跨域框架由 Node 侧并行轮询，命中就立刻返回，不会白等预算）。
 
-跨域的框架（不同域名或端口）浏览器内核禁止读取，插件会在输出里明确写出来：`1 cross-origin frame(s) cannot be read: https://...`。**看到这句就意味着那部分内容对工具不可见**，只能用 `x`/`y` 坐标硬点，且点完的结果读不回来。要处理这类页面，得等跨域框架支持（见 Roadmap）。
+跨域框架能读，是因为 Chrome 给了两条不同的路：**不同源但同站**（另一个端口、另一个子域）的框架还在同一个渲染进程里，用 `Page.createIsolatedWorld` 建一个隔离世界就能查；**不同站**（真正的第三方嵌入）会被站点隔离拆到独立进程，它**根本不在页面级 frame tree 里**，只能靠 `Target.attachedToTarget` 拿到会话，命令都要带 `sessionId`。两种都实测覆盖了——测试里同时摆了这三个场景。
+
+只有确实读不到的（比如浏览器给了框架 id 却不肯给脚本上下文）才会写 `N cross-origin frame(s) still cannot be read`，并给出原因。
 
 **右键**用 `browser_click { "button": "right" }`。它触发的是页面的 `contextmenu`（web app 自己的菜单会正常弹出）；浏览器原生的那个菜单在无窗口模式下不渲染，也点不到——真要操作它请改 `headless: false`。
 
@@ -123,6 +134,33 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 也就是点完就知道，不用额外调用。要看全量、或等大文件下完，用 `browser_download`（`wait: true` 会阻塞到传输结束）。同名下载**不会互相覆盖**：第二份叫 `report (1).csv`。
 
 默认不写系统「下载」文件夹是有意的：那是用户的目录，插件不经允许不该往里放东西；想把 `downloadDir` 指到那里随时可以。
+
+## 桌面平面（原生窗口）
+
+浏览器那套只覆盖有 DOM 的东西。微信、Word、安装包、记事本这些**没有 DOM**，但它们有窗口、有子控件、有消息队列——三样都能在不碰前台窗口的前提下操作。桌面平面就是干这个的，走的是 `helpers/desktop-agent.py`（Win32 + ctypes，除标准库外零依赖），插件通过**一行一条 JSON** 的管道驱动它。
+
+```text
+desktop_windows                       → 找窗口，拿到 w004e0592
+desktop_tree { window }               → 读控件，拿到 c000c0682
+desktop_act  { action:"type", target, text }
+desktop_act  { action:"read", target } → 读回来，确认真的写进去了
+```
+
+**隔离桌面是重点。** `desktop_launch` 默认先 `CreateDesktopW` 建一个隐藏桌面，再把程序和一个小 worker 一起放上去。worker 在那边负责枚举、画图、发消息，主进程通过回环 socket 中转。因为 Windows 的 `EnumWindows` / `PrintWindow` 只看**调用线程所在的桌面**，所以必须有进程住在那个桌面上。效果：
+
+- 程序的窗口**不出现在你的屏幕上**，不会盖住你的东西，也不会抢焦点；
+- 你照样能读它的控件、往里打字、截图、点按钮；
+- 关掉插件（或它自己退出）时这些桌面和进程一起消失。
+
+**点击**是往目标控件 `PostMessage(WM_LBUTTONDOWN/UP)`，光标不动、焦点不变。标准控件（按钮、编辑框、列表）接得住；少数只认真实输入的现代应用会忽略它——结果里会提醒你先 `desktop_shot` 看一眼再换目标。`desktop_act` 的 `x`/`y` 是**客户区像素**，和 `desktop_shot` 返回的图一一对应。
+
+**输入文字**：`Edit` / `RichEdit` 类控件走 `WM_SETTEXT`（一次写完整串，中文没问题），其它控件逐字符 `WM_CHAR`。写完务必用 `action:"read"` 读回来——打字没进去和打字成功，从外面看是一样的。
+
+**截图**用 `PrintWindow` 让程序自己画到我们的位图里，所以窗口被遮住也能截；最小化的窗口没东西可画，会直接说而不是给一张黑图。
+
+**能看到什么**：经典 Win32 控件（记事本的编辑框、系统对话框的按钮、资源管理器的部分控件）。现代应用（Chromium / WPF / Electron）整窗自绘，控件树是空的——这时用 `desktop_shot` 看图 + `x`/`y` 点击。真正的 UIA 语义树（能读出 Word 的段落、微信的会话列表）是另一件事，见 Roadmap。
+
+**为什么是 Python**：UIA 那条路（.NET `UIAutomationClient`）控件树更丰富，但开发环境里 `Add-Type` 一类调用被沙箱拦死，**一条命令都验证不了**。与其交付一堆没跑过的自动化代码，不如用一条每条断言都实跑过的路。缺 Python 3 时桌面平面自己报"不可用"，浏览器侧照常工作（`desktop: false` 可以彻底关掉）。
 
 ## 验证
 
@@ -164,7 +202,7 @@ live（真实网站）
 
 ## 已知边界
 
-- **只覆盖浏览器里的东西。** 本地软件的窗口和控件不在这一版范围内，那是桌面平面的活（见 Roadmap）。
+- **浏览器和原生窗口是两套东西。** `browser_*` 只管私有浏览器里的页面；本地软件走 `desktop_*`（桌面平面）。两边互不影响：关掉浏览器不动桌面 helper，反之亦然。
 - **私有 profile 是全新的。** 它没有你日常浏览器的 cookie 和登录态，需要登录的站点得在它里面登一次；登录态会保存在 `<DSH_HOME>/dsh-computer-use-bg/profile`，下次复用。
 - **CDP 端口是本机回环。** 默认只监听 `127.0.0.1`。要远程用，别直接暴露，走 SSH 隧道。
 - **`--headless` 下部分站点会识别出无头浏览器。** 默认就是无窗口，遇到硬性反爬的站点可临时把 `headless` 设成 `false` 再试一次。
@@ -173,11 +211,17 @@ live（真实网站）
 - **`browser_eval` 能执行任意 JS。** 只在你信任的页面上用。
 - **`browser_hover` 的「新出现了什么」靠对比两次元素快照。** 画在 canvas 里、或者只改了自己尺寸而没有新 DOM 元素的弹层（少数老式编辑器）看不到，这时候改用坐标 + 截图判断。
 - **拖拽只覆盖页面内部的元素。** 从资源管理器拖文件进网页要单独用 `browser_drop_files`（它靠 CDP 的 drag 通道带真实路径，不是鼠标手势）；纯鼠标拖拽做不了这件事。
-- **跨域 iframe 读不到，这是浏览器的同源策略，不是实现偷懒。** 输出里会明确写「N 个跨域 frame 读不到」并列出地址。同源的则完全透明。
+- **跨域 iframe 能读，但读的是它自己的文档。** 页面 JS 里的变量（`window.xxx`）在隔离世界里看不到，能读能点的是 DOM、文字和控件。少数把内容画在 canvas 上的第三方嵌入（地图、编辑器）依然只能截图看。
 - **iframe 内的元素坐标是"顶层视口坐标"。** 如果 iframe 自己有内部滚动条且内容滚到底了，坐标仍然正确；但如果页面在快照之后滚动了外层容器，`ref` 就要重新取。
 - **下载控制是浏览器级的。** `Browser.setDownloadBehavior` 没有指定 context，所以这个私有浏览器里任何页面发起的下载都会落盘并被记录，包括开在新标签页里的链接——那个标签页现在也能直接读（`browser_tabs`）。
 - **大到超出 `browser_download` 默认 30 秒预算的文件**不会等完 —— 它会如实说「still downloading」，稍后再查即可，文件继续在后台传。
 - **浏览器自己的界面页不算标签页。** `edge://`、`chrome://` 这类地址不列在 `browser_tabs` 里、也不会被自动跟随：那是浏览器 UI，不是网页，驱动它没有意义。它们照样占着一个真实标签页，所以「标签页数量」可能比你看到的多。
+- **桌面平面需要 Python 3（只用标准库）。** 找不到时它会明确报"不可用"，浏览器侧照常工作。`desktop: false` 可以彻底关掉。
+- **现代自绘窗口没有控件树。** Chromium / WPF / Electron 整窗只有一个顶层 HWND，`desktop_tree` 会是空的。这时用 `desktop_shot` 看图 + `x`/`y` 点击。真正的语义树要 UIA，见 Roadmap。
+- **posted 消息不是真实输入。** 少数应用只认 `SendInput`（真实输入），会忽略 `PostMessage`。这条路**故意不默认走**：真实输入必然要抢前台，那就不是"后台"了。
+- **最小化的窗口截不到内容**（没有东西被绘制），会直接报错而不是给黑图。`desktop_launch` 启动的程序默认不最小化。
+- **隔离桌面里的程序你用肉眼看不到。** 这是它的用途，但也意味着出了问题只能靠 `desktop_windows` / `desktop_tree` / `desktop_shot` 观察。想看着它跑，`isolated: false`。
+- **桌面 helper 也会空闲回收**（默认 5 分钟没调用就退出，连带它拥有的隔离桌面和程序一起消失）。
 
 ## Roadmap
 
@@ -191,8 +235,11 @@ live（真实网站）
 - [x] **多标签页**（`browser_tabs` + 每次调用后对比 target 集合）：`target=_blank` / OAuth 弹窗自动跟随，列表 / 新建 / 切换 / 关闭齐全
 - [x] **从系统拖文件进页面**（`Input.dispatchDragEvent` + `files`）：`DataTransfer.files` 里是真实文件，名字和大小都对
 - [x] **元素截图裁剪**（`Page.captureScreenshot` + `clip`）：按 ref / 选择器 / 区域出图，`scale` 可放大
-- [ ] **跨域 iframe**：不同域名或端口的框架受同源策略限制，现在只能报出"有 N 个读不到"。要做需要走 `Page.getFrameTree` + 各自执行上下文，属于单独一轮
-- [ ] **桌面平面**：UIA 控件树（文本，不用截图）+ 隔离桌面（`CreateDesktop`）里跑真实输入，让本地软件也能操作而不抢前台 —— 这是 `@copylee` / `windows-mcp` 那套做不到的
+- [x] **跨域 iframe**：不同源同站走 `Page.createIsolatedWorld`，跨站（独立进程）走 `Target.attachToTarget` + `sessionId`，快照 / 文字 / 等待 / 点击 / 输入 / 上传全部打通
+- [x] **桌面平面（v1）**：`desktop_windows` / `desktop_tree` / `desktop_act` / `desktop_shot` / `desktop_launch`；隔离桌面（`CreateDesktopW` + 桌内 worker）里枚举、绘制、发消息，不抢前台
+- [ ] **桌面平面 v2（UIA）**：`UIAutomationClient` 能给出现代应用的语义树（Word 的段落、微信的会话列表），比 Win32 子窗口枚举强得多。这一版没做是因为开发环境里 .NET 动态加载被拦，无法验证
+- [ ] 桌面平面的**真实输入**可选模式（`SendInput` + 主动抢前台），给那些忽略 posted 消息的应用
+- [ ] 跨域 iframe 里的 `browser_eval`（现在只在主文档执行）
 
 ## 开发
 
@@ -200,7 +247,8 @@ live（真实网站）
 node tests/load.mjs           # 离线：按 DSH 的严格契约复刻注册校验（改动后先跑这个）
 node tests/tools.mjs          # 工具接线：每个返回值都用自己的 output.schema 校验一遍
 node tests/idle.mjs           # 空闲回收：进程确实会退出
-node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/裁剪/等待/对话框/上传/导航/hover/拖拽/拖文件/iframe/下载/标签页（27 步）
+node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/裁剪/等待/对话框/上传/导航/hover/拖拽/拖文件/跨域 iframe/下载/标签页（30 步）
+node tests/desktop.mjs        # 桌面平面端到端：隔离桌面里启动记事本/对话框，读控件、输入、回读、截图、点击关窗
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
 ```
@@ -209,14 +257,18 @@ node tests/live.mjs https://github.com
 `tests/iframe-fixture.mjs` 起两个真实 HTTP 端口造同源 + 跨域框架——`file://` 页面之间全都是不透明源，用它测同源等于什么都没测。
 `tests/download-fixture.mjs` 也一样：`Content-Disposition` 定名和"下载中的状态"只有真实 HTTP 响应能有，`file://` 触发不了下载。
 `tests/png.mjs` 是给测试用的最小 PNG 解码器：裁剪截图对不对只能看**像素**（长度和尺寸都能骗人）。
+`tests/desktop.mjs` 会在**隔离桌面**上真的开一个记事本和一个系统对话框：断言全部来自数据（窗口列表、控件文字、截图像素），不依赖"人看一眼"；跑完自己把进程和桌面清掉。
 
 代码结构：
 
 ```
-lib/cdp.js     零依赖 CDP 客户端 + 私有 Chromium 生命周期（含浏览器级下载控制、标签页管理）
-lib/page.js    页面操作（快照 / 点击 / 输入 / 键盘 / 截图与裁剪 / 文本 / 等待 / 上传 / 拖文件 / 跨框架遍历）
-lib/index.js   插件入口：apply(ctx, config) 与工具定义
-tests/         端到端验证
+lib/cdp.js      零依赖 CDP 客户端 + 私有 Chromium 生命周期（含浏览器级下载控制、标签页管理、OOPIF 会话）
+lib/page.js     页面操作（快照 / 点击 / 输入 / 键盘 / 截图与裁剪 / 文本 / 等待 / 上传 / 拖文件 / 跨框架遍历）
+lib/frames.js   页面 / 自己进程 / 独立进程三层框架的发现、隔离世界、坐标换算、跨帧等待与上传
+lib/desktop.js  桌面 helper 的客户端（JSON 管道、python 探测、空闲回收）
+lib/index.js    插件入口：apply(ctx, config) 与 24 个工具定义
+helpers/        desktop-agent.py —— Win32 + ctypes，隔离桌面的 worker 也在这个文件里
+tests/          端到端验证
 ```
 
 ## 踩过的坑（写给后来改这代码的人）
@@ -252,15 +304,23 @@ tests/         端到端验证
 11. **`DOM.requestNode` 之前必须先 `DOM.getDocument`。** 否则它返回 `{ nodeId: 0 }` —— 不报错，看起来成功了，下一步才莫名其妙失败。要拿 iframe 里的元素，只能靠这个组合（`DOM.querySelector` 只查主文档）：`Runtime.evaluate` 遍历子框架返回元素 → 拿 `objectId` → `DOM.requestNode` → `DOM.setFileInputFiles`。跨 frame 的 `objectId` 是可以用的，不用切执行上下文。
 12. **iframe 里元素的 `getBoundingClientRect()` 是相对它自己那个 viewport 的。** 要换算到顶层才有意义：逐层累加 `rect.left + clientLeft`（`clientLeft` 就是 border 宽度，漏了会偏几像素，足够点到旁边那个控件上）。另外**别把 iframe 内部滚动算进去**——`getBoundingClientRect` 已经把内部滚动算完了，再加一次就错。
 13. **`iframe.contentDocument` 跨域时返回 `null` 而不抛错**（旧浏览器会抛）。两种情况都要接住，否则一个广告位就能让整页快照变成空。
-14. **`Page.captureScreenshot` 的 `clip` 是文档坐标，不是视口坐标。** 把 `getBoundingClientRect()` 的结果直接当 clip 传进去，会得到一张尺寸完全正确、内容纯白/纯灰的图 —— 不报错，看起来像"页面就是这么白"。必须先 `+ scrollX/scrollY`。`tests/smoke.mjs` 第 26 步专门解 PNG 验中心像素，就是为了钉住这一条。
-15. **Edge 每次下载都会顺手开一个 `edge://downloads-hub/` 标签页。** 如果"有新标签页就跟过去"，点完导出整个会话就被拽到浏览器 UI 上，网站其实还在，但工具看着它、却读不到任何东西。所以 `listTabs()` 明确过滤 `edge:/chrome:/chrome-untrusted:` 这类 scheme —— 既不在列表里出现，也不参与跟随。
-16. **浏览器级 socket 只能武装一次。** 冷启动会重新走 `#start()`，每次都 `Browser.setDownloadBehavior` 的话，旧 socket 不会自己关（泄漏），而且下载事件会重复计一份。现在只在 `browserConnection` 为空或已关闭时才重新武装。
-17. **页面级 socket 收不到"新标签页"事件。** `Target.targetCreated` 只在浏览器级 socket 上，页面级只能看到自己被换了文档。所以跟随是靠**对比 target 集合**做的：每次工具调用后 `GET /json/list`，id 不在上次集合里的就是刚开出来的。
-18. **关掉正在驱动的标签页会让会话悬空。** socket 会 `close`，之后每条命令都报 "CDP socket is closed"。`closeTab` 必须在自己关掉连接后挑一个还活着的标签页接上（一个都没有就新建），否则用户从此只能重启插件。
-14. **`Browser.setDownloadBehavior` 在浏览器级 target 上，页面 socket 调不到。** 必须再开一条 `/json/version` 的 socket（本插件叫 `browserConnection`，和页面会话互不干扰），并且带上 `eventsEnabled: true`，否则 `Browser.downloadWillBegin` / `downloadProgress` **一个都不会来** —— 文件会落盘，但你无从知道。
-15. **`behavior: "allow"` 会静默覆盖同名文件。** 这一点和日常浏览器的「下载」文件夹不一样：连点两次「导出 CSV」，磁盘上只剩一份，前一份数据被替换掉而且没有任何提示。改用 `allowAndName`（按 guid 存，绝不撞名），完成后再自己 `rename` 成 `report.csv` / `report (1).csv`。
-16. **`downloadProgress` 的 `completed` 早于最终改名几毫秒。** 收到就去找文件会扑空（`existsSync` 为 false，看起来像"文件没下下来"）。所以路径解析是**惰性**的：拿不到就留空，下次读再试；`waitForDownloads` 在收尾时额外给 800ms 重试窗口。
-17. **`allowAndName` 的文件名是 guid，`suggestedFilename` 只在事件里。** 协议从不告诉你最终绝对路径，所以「名字 → 路径」这一步只能自己做。反过来这也意味着：**文件名来自 HTTP 响应头**，写盘前必须自己清洗 `\ / : * ? " < > |`，不能当成可信输入。
+14. **跨站 iframe 根本不在 `Page.getFrameTree` 里。** 站点隔离把它拆到独立进程后，页面级的 frame tree 只列同进程的框架——枚举少一个、点击坐标还算得对，只有"读不到内容"这一个症状。信号是 `Target.attachedToTarget`（`type: "iframe"`，`targetId` 就是 frameId），命令必须带 `sessionId`。晚开 `setAutoAttach` 也能收到已经存在的目标，这一点实测过，不用另做发现。
+15. **`DOM.getBoxModel` 的 `content` 四元组是"顶层视口坐标"，而且随滚动更新。** 子框架自己的 `getBoundingClientRect` 是它自己视口的，两者相加就是顶层坐标——不要再叠祖先链，也不要做滚动补偿（滚 120px 后实测跟着变）。这和 `Page.captureScreenshot` 的 `clip` 是**文档坐标**正好相反，两个都栽过一次。
+16. **`CreateDesktopW` 在 user32，不在 kernel32。** 猜错的表现是 `AttributeError: function 'CreateDesktopW' not found`，浪费一轮。
+17. **`CreateProcessW` 的 `lpDesktop` 留空才是对的。** 留空 = 继承父进程桌面：父进程在用户桌面就开在用户桌面，worker 在隔离桌面就开在隔离桌面。写成"隔离桌面的名字"反而会让程序开到一个看不见、也查不到的地方（worker 的 `Isolated.name` 是 `worker`，照抄就中招）。
+18. **`EnumChildWindows` 返回所有后代，不是直接子窗口。** 拿它做 BFS 会把孙子节点重复列两遍、深度还错。用 `GetWindow(hwnd, GW_CHILD)` + `GW_HWNDNEXT` 逐层走。
+19. **`WM_SETTEXT` 的字符串必须是活着的缓冲区。** `send(WM_SETTEXT, 0, cast(c_wchar_p(text), c_void_p).value)` 这句里，临时 `c_wchar_p` 在 `.value` 取完之后就没有引用了，GC 可以在调用前回收——控件于是把那段已释放的内存存下来，读回去是几个乱码（本例是 `"붰戆˲"`）。改成 `create_unicode_buffer` 存变量，`addressof` 传地址。
+20. **python 子进程的 stdio 不 `unref()` 会拖住宿主退出。** 测试跑完全绿却不退出，卡在事件循环上。`child.unref()` 加上三个管道一起 unref，读还是照常读，只是不再计入 ref count。
+21. **`SendMessageTimeoutW` 跨桌面会被静默拒绝。** 所以"看另一个桌面的窗口"不能靠一次 SendMessage 解决，必须有一个进程**住在那张桌面上**（worker 模式就是这么来的）。返回 0 时不要当成功，代码里要显式区分 `None`。
+22. **`Page.captureScreenshot` 的 `clip` 是文档坐标，不是视口坐标。** 把 `getBoundingClientRect()` 的结果直接当 clip 传进去，会得到一张尺寸完全正确、内容纯白/纯灰的图 —— 不报错，看起来像"页面就是这么白"。必须先 `+ scrollX/scrollY`。`tests/smoke.mjs` 第 26 步专门解 PNG 验中心像素，就是为了钉住这一条。
+23. **Edge 每次下载都会顺手开一个 `edge://downloads-hub/` 标签页。** 如果"有新标签页就跟过去"，点完导出整个会话就被拽到浏览器 UI 上，网站其实还在，但工具看着它、却读不到任何东西。所以 `listTabs()` 明确过滤 `edge:/chrome:/chrome-untrusted:` 这类 scheme —— 既不在列表里出现，也不参与跟随。
+24. **浏览器级 socket 只能武装一次。** 冷启动会重新走 `#start()`，每次都 `Browser.setDownloadBehavior` 的话，旧 socket 不会自己关（泄漏），而且下载事件会重复计一份。现在只在 `browserConnection` 为空或已关闭时才重新武装。
+25. **页面级 socket 收不到"新标签页"事件。** `Target.targetCreated` 只在浏览器级 socket 上，页面级只能看到自己被换了文档。所以跟随是靠**对比 target 集合**做的：每次工具调用后 `GET /json/list`，id 不在上次集合里的就是刚开出来的。
+26. **关掉正在驱动的标签页会让会话悬空。** socket 会 `close`，之后每条命令都报 "CDP socket is closed"。`closeTab` 必须在自己关掉连接后挑一个还活着的标签页接上（一个都没有就新建），否则用户从此只能重启插件。
+27. **`Browser.setDownloadBehavior` 在浏览器级 target 上，页面 socket 调不到。** 必须再开一条 `/json/version` 的 socket（本插件叫 `browserConnection`，和页面会话互不干扰），并且带上 `eventsEnabled: true`，否则 `Browser.downloadWillBegin` / `downloadProgress` **一个都不会来** —— 文件会落盘，但你无从知道。
+28. **`behavior: "allow"` 会静默覆盖同名文件。** 这一点和日常浏览器的「下载」文件夹不一样：连点两次「导出 CSV」，磁盘上只剩一份，前一份数据被替换掉而且没有任何提示。改用 `allowAndName`（按 guid 存，绝不撞名），完成后再自己 `rename` 成 `report.csv` / `report (1).csv`。
+29. **`downloadProgress` 的 `completed` 早于最终改名几毫秒。** 收到就去找文件会扑空（`existsSync` 为 false，看起来像"文件没下下来"）。所以路径解析是**惰性**的：拿不到就留空，下次读再试；`waitForDownloads` 在收尾时额外给 800ms 重试窗口。
+30. **`allowAndName` 的文件名是 guid，`suggestedFilename` 只在事件里。** 协议从不告诉你最终绝对路径，所以「名字 → 路径」这一步只能自己做。反过来这也意味着：**文件名来自 HTTP 响应头**，写盘前必须自己清洗 `\ / : * ? " < > |`，不能当成可信输入。
 
 ## License
 

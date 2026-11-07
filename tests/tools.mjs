@@ -113,12 +113,18 @@ const fail = (label, detail = '') => {
 
 // --- mock cordis ctx -------------------------------------------------------
 const registered = new Map();
+const disposers = [];
 // The attachment store sees the real bytes, so the test can decode the image and
 // check the pixels a cropped screenshot claims to contain.
 const savedImages = [];
 const services = {
   logger: { info() {}, warn() {}, error() {} },
-  effect: (fn) => fn(),
+  // The real host keeps the disposer and runs it on unload; collecting them here means
+  // the desktop helper is actually shut down at the end instead of outliving the test.
+  effect: (fn) => {
+    const dispose = fn();
+    if (typeof dispose === 'function') disposers.push(dispose);
+  },
   tools: {
     register(tool) {
       registered.set(tool.name, tool);
@@ -243,8 +249,16 @@ try {
     const framed = await call('browser_snapshot', { screenshot: false });
     if (framed.text.includes('(f0)') && framed.text.includes('Inner button')) ok('framed element tagged (f0)');
     else fail('framed tag', framed.text.split('\n').slice(0, 8).join(' | '));
-    if (framed.text.includes('cross-origin frame(s) cannot be read')) ok('cross-origin warning printed');
-    else fail('cross-origin warning', framed.text.split('\n').slice(0, 8).join(' | '));
+
+    // Cross-origin frames used to end at "N frames cannot be read". They are read now,
+    // and the header has to say so instead of warning about the opposite.
+    if (/Read through \d+ cross-origin frame\(s\)/.test(framed.text) && framed.text.includes('own process')) {
+      ok('cross-origin frames reported as read', framed.text.split('\n').find((row) => row.includes('Read through')).slice(0, 90));
+    } else {
+      fail('cross-origin header', framed.text.split('\n').slice(0, 8).join(' | '));
+    }
+    if (framed.text.includes('(fx0)')) ok('the separate-process frame is tagged (fx0)');
+    else fail('fx0 tag', framed.text.split('\n').filter((row) => row.includes('Foreign button')).join(' | '));
 
     // A ref that lives in the frame must survive the whole chain: locate → translate
     // the coordinates → click → the child document seeing it.
@@ -259,6 +273,29 @@ try {
       if (clicked.text.includes('Clicked') && flag.text.trim() === 'true') ok('click by framed ref landed inside');
       else fail('click by framed ref', `${clicked.text.split('\n')[0]} / flag ${flag.text}`);
     }
+
+    // Same flow for a ref that is not in this process at all: the number comes from the
+    // cross-origin scan, so the click path has to find it in that frame's own document.
+    const crossLine = framed.text.split('\n').find((row) => row.includes('(fx0)') && row.includes('Foreign button'));
+    const crossRef = crossLine ? Number((crossLine.match(/^#(\d+)/) || [])[1]) : NaN;
+    if (!Number.isFinite(crossRef)) fail('parse cross-frame ref', String(crossLine));
+    else {
+      const clicked = await call('browser_click', { ref: crossRef, screenshot: false });
+      const after = await call('browser_snapshot', { screenshot: false });
+      const landed = after.text.split('\n').find((row) => row.includes('(fx0)') && row.includes('clicked'));
+      if (clicked.text.includes('Clicked') && landed) ok('click by cross-process ref landed in that frame');
+      else fail('click by cross-process ref', `${clicked.text.split('\n')[0]} / ${after.text.split('\n').filter((r) => r.includes('(fx0)')).join(' | ')}`);
+    }
+
+    // Text has to include the frame bodies too, with a marker saying whose they are.
+    const text = await call('browser_text', {});
+    if (text.text.includes('[frame x0') && text.text.includes('Foreign button')) ok('browser_text reads cross-origin frames', `${text.text.length} chars`);
+    else fail('text across frames', text.text.slice(0, 200));
+
+    // And a wait whose condition only exists inside a frame must not burn the budget.
+    const waited = await call('browser_wait', { text: 'Foreign button', timeoutMs: 5000 });
+    if (/Wait satisfied/.test(waited.text)) ok('a wait matches inside a cross-origin frame', waited.text.split('\n')[0].slice(0, 80));
+    else fail('wait across frames', waited.text.split('\n')[0]);
   } finally {
     sites.close();
   }
@@ -385,6 +422,50 @@ try {
   if (closed.text.includes('shut down')) ok('close');
   else fail('close', closed.text.slice(0, 120));
 
+  console.log('16) the desktop plane drives a native app through its tools');
+  const notepad = 'C:\\Windows\\System32\\notepad.exe';
+  let desktopName = '';
+  let windowId = '';
+  let pid = 0;
+  try {
+    const launched = await call('desktop_launch', { path: notepad, isolated: true, name: 'dsh-tools-test' });
+    const launchedLine = launched.text.split('\n')[0];
+    if (/on its own desktop/.test(launched.text) && /window is w/.test(launched.text)) ok('launched off-screen', launchedLine.slice(0, 90));
+    else fail('desktop_launch', launched.text.slice(0, 200));
+    desktopName = (launched.text.match(/desktop "([^"]+)"/) || [])[1] || '';
+    windowId = (launched.text.match(/window is (w[0-9a-f]+)/) || [])[1] || '';
+    pid = Number((launched.text.match(/pid (\d+)/) || [])[1] || 0);
+
+    const list = await call('desktop_windows', {});
+    if (list.text.includes(desktopName) && list.text.includes(windowId)) ok('desktop_windows shows it on its own desktop');
+    else fail('desktop_windows', list.text.split('\n').slice(0, 6).join(' | '));
+
+    const tree = await call('desktop_tree', { window: windowId, desktop: desktopName });
+    const control = (tree.text.match(/^\s+(c[0-9a-f]+) text field/m) || [])[1];
+    if (control) ok('desktop_tree found the text field', control);
+    else fail('desktop_tree', tree.text.split('\n').slice(0, 6).join(' | '));
+
+    const typed = 'tool layer desktop check';
+    const wrote = await call('desktop_act', { action: 'type', target: control, text: typed, desktop: desktopName });
+    if (/Typed \d+ character/.test(wrote.text)) ok('desktop_act typed into it', wrote.text.split('\n')[0].slice(0, 70));
+    else fail('desktop_act type', wrote.text);
+
+    // Reading it back is the only proof that typing went somewhere real.
+    const read = await call('desktop_act', { action: 'read', target: control, desktop: desktopName });
+    if (read.text.includes(typed)) ok('the control reads back exactly that');
+    else fail('desktop_act read', read.text.slice(0, 160));
+
+    const shot = await call('desktop_shot', { window: windowId, desktop: desktopName });
+    if (shot.image?.attachmentId && /client area/.test(shot.text)) ok('desktop_shot returned an attachment', `${shot.image.width}x${shot.image.height}`);
+    else fail('desktop_shot', shot.text.slice(0, 160));
+  } finally {
+    if (pid > 0) {
+      const killed = await call('desktop_launch', { kill: pid }).catch((error) => ({ text: error.message }));
+      if (/Ended pid/.test(killed.text)) ok('the app it started is gone again');
+      else fail('desktop_launch kill', killed.text.slice(0, 120));
+    }
+  }
+
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
   if (failures > 0) process.exitCode = 1;
 } catch (error) {
@@ -393,4 +474,11 @@ try {
   process.exitCode = 1;
 } finally {
   await call('browser_close').catch(() => {});
+  for (const dispose of disposers.splice(0)) {
+    try {
+      await dispose();
+    } catch {
+      /* a failing disposer must not hide the test result */
+    }
+  }
 }

@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { BrowserHost } from '../lib/cdp.js';
+import { readText, snapshotAll, uploadInFrames, waitAcrossFrames } from '../lib/frames.js';
 import { ATTR_BODY, HEADER_BODY, SLOW_BYTES, startDownloadSite } from './download-fixture.mjs';
 import { startIframeSites } from './iframe-fixture.mjs';
 import {
@@ -439,7 +440,9 @@ try {
   else fail('frame path', `inner=${JSON.stringify(innerBtn?.frame)} outer=${JSON.stringify(outerBtn?.frame)}`);
 
   const blocked = framed.frames?.blocked || [];
-  if (framed.frames?.scanned === 1 && blocked.length === 1) ok('cross-origin frame reported, not thrown', blocked[0]);
+  // Three frames resist the page-side walk now: another port (cross-origin, same
+  // process), another host (cross-site, own process) and the nested pair.
+  if (framed.frames?.scanned === 1 && blocked.length === 3) ok('cross-origin frames reported, not thrown', `${blocked.length} blocked`);
   else fail('cross-origin report', JSON.stringify(framed.frames));
 
   console.log('18) clicks and typing land inside the frame');
@@ -686,6 +689,82 @@ try {
     else fail('close active tab', JSON.stringify({ alive, handedOver }));
   } catch (error) {
     fail('tabs', error.message);
+  }
+
+  console.log('28) cross-origin frames are read through isolated worlds');
+  try {
+    await navigate(conn, sites.outerUrl, { timeoutMs: 20000 });
+    const crossSnap = await snapshotAll(conn);
+    const foreignAll = crossSnap.elements.filter((el) => el.name === 'Foreign button');
+    const framePaths = [...new Set(foreignAll.map((el) => el.frame))].sort();
+    // Three regimes, one button each: another port (same process), the nested one, and
+    // `localhost` vs `127.0.0.1`, which Chrome puts in a process of its own.
+    if (framePaths.length === 3) ok('all three cross-origin regimes listed', framePaths.join(', '));
+    else fail('cross-origin frames in snapshot', JSON.stringify(crossSnap.elements.map((e) => `${e.name}@${e.frame}`)));
+
+    const reported = crossSnap.frames?.cross ?? [];
+    // The nested host frame is listed too (it has no controls of its own, only a child),
+    // so the assertion is about the three documents that do hold elements.
+    const withElements = reported.filter((frame) => frame.count > 0).map((frame) => frame.path).sort();
+    if (withElements.join(',') === '1,2.0,x0') ok('each one reported as read', reported.map((f) => `${f.path}:${f.count}${f.process ? '(own process)' : ''}`).join(' '));
+    else fail('frame report', JSON.stringify(crossSnap.frames));
+
+    const ownProcess = reported.filter((f) => f.process);
+    if (ownProcess.length === 1 && ownProcess[0].path === 'x0') ok('the cross-site frame runs in its own process', ownProcess[0].url);
+    else fail('own-process frame', JSON.stringify(reported));
+
+    console.log('29) clicks and typing reach a frame in its own process');
+    for (const path of framePaths) {
+      const btn = (await snapshotAll(conn)).elements.find(
+        (el) => el.frame === path && (el.name === 'Foreign button' || el.name === 'clicked'),
+      );
+      if (!btn) {
+        fail(`button in frame ${path}`, 'not found');
+        continue;
+      }
+      if (btn.name === 'clicked') {
+        ok(`click landed in frame ${path}`, 'already clicked');
+        continue;
+      }
+      await clickAt(conn, btn.x, btn.y);
+      await sleep(320);
+      const now = (await snapshotAll(conn)).elements.find((el) => el.frame === path && el.name === 'clicked');
+      if (now) ok(`click landed in frame ${path}`, `(${btn.x}, ${btn.y})`);
+      else fail(`click in frame ${path}`, `still "${btn.name}" at (${btn.x}, ${btn.y})`);
+    }
+
+    // Typing is the other half of input: focus by click, then insert text.
+    const field = (await snapshotAll(conn)).elements.find((el) => el.frame === 'x0' && el.name === 'Foreign name');
+    if (!field) fail('framed input', 'not found');
+    else {
+      await clickAt(conn, field.x, field.y);
+      await insertText(conn, 'typed through a frame boundary');
+      await sleep(250);
+      const echoed = await readText(conn, 6000);
+      if (echoed.includes('typed: typed through a frame boundary')) ok('typing reached a cross-process frame');
+      else fail('typing through frame', echoed.slice(0, 200));
+      await evaluate(conn, `document.querySelector('#site').blur()`);
+    }
+
+    console.log('30) text, waiting and uploads cross frame boundaries too');
+    const spannedText = await readText(conn, 8000);
+    if (spannedText.includes('[frame 1') && spannedText.includes('[frame x0')) {
+      ok('page text includes the cross-origin frames', `${spannedText.length} chars`);
+    } else {
+      fail('text across frames', spannedText.slice(0, 240));
+    }
+
+    const uploaded = await uploadInFrames(conn, { selector: '#foreign-file', files: [uploadFile] }).catch((error) => ({ error: error.message }));
+    if (uploaded?.count === 1) ok('upload reached a framed file input', `frame ${uploaded.frame}`);
+    else fail('upload through frame', JSON.stringify(uploaded));
+
+    // The condition only becomes true inside the frame, so this is the frame-side wait
+    // doing the work, not the page-side one.
+    const waited = await waitAcrossFrames(conn, { text: 'file: upload-me.txt', timeoutMs: 6000 });
+    if (waited?.ok && waited.inFrame) ok('a wait matched inside a cross-origin frame', `${waited.elapsed}ms, frame ${waited.frame}`);
+    else fail('wait across frames', JSON.stringify(waited));
+  } catch (error) {
+    fail('cross-origin frames', error.message);
   }
 
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
