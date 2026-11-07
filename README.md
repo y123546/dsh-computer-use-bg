@@ -54,6 +54,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     height: 900
     browserPath: ''       # 留空自动探测 Edge/Chrome
     profileDir: ''        # 留空用 <DSH_HOME>/dsh-computer-use-bg/profile
+    downloadDir: ''       # 留空用 <DSH_HOME>/dsh-computer-use-bg/downloads
     timeoutMs: 25000      # 冷启动等待上限
     dialogBehavior: accept  # accept | dismiss —— alert/confirm/prompt 怎么自动应答
     dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
@@ -76,6 +77,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_wait` | 等条件成立：元素出现 / 文字出现 / 元素消失 / 加载完成。比固定 sleep 稳，超时会告诉你页面实际长什么样 |
 | `browser_nav` | 前进 / 后退 / 刷新。到边界会明确报错，不会假装成功 |
 | `browser_upload` | 给 `<input type="file">` 塞本地文件，不弹系统选择框（输入框是隐藏的也能塞） |
+| `browser_download` | 看这次会话下载了什么、文件落在哪个绝对路径；`wait: true` 等到传输结束 |
 | `browser_hover` | 悬停后告诉模型**新出现了什么**（下拉菜单、tooltip），并给这些新元素的 `ref`，接着就能点 |
 | `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
@@ -94,6 +96,16 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 - 原生 HTML5（`draggable="true"`）：`dragstart` / `dragover` / `drop`。**目标必须自己处理 `dragover` 并 `preventDefault()`**，否则永远收不到 `drop`——结果里会明确写「起了个 drag 但没有 drop」，而不是假装成功。
 
 `alert` / `confirm` / `prompt` 会**自动应答**（默认 accept），否则渲染器会卡死、后面每条命令都超时。被应答的对话框会附在下一次工具结果的末尾，例如 `(dialog handled automatically: confirm("sure?") — accepted)` —— 不会悄悄吞掉。要改成 dismiss，见下面的 `dialogBehavior`。
+
+**下载不会丢。** 无窗口浏览器默认把下载直接丢弃——点「导出 CSV」成功了却什么都没有，看起来像按钮坏了。插件启动时就把下载控制打开（`Browser.setDownloadBehavior`），文件落在 `<DSH_HOME>/dsh-computer-use-bg/downloads`（`downloadDir` 可改）。因为**下载不改变页面**，结果末尾会主动附一句：
+
+```
+(download: "report.csv" finished (12.3 KB) — F:\Deepseek\data\dsh-home\dsh-computer-use-bg\downloads\report.csv)
+```
+
+也就是点完就知道，不用额外调用。要看全量、或等大文件下完，用 `browser_download`（`wait: true` 会阻塞到传输结束）。同名下载**不会互相覆盖**：第二份叫 `report (1).csv`。
+
+默认不写系统「下载」文件夹是有意的：那是用户的目录，插件不经允许不该往里放东西；想把 `downloadDir` 指到那里随时可以。
 
 ## 验证
 
@@ -146,6 +158,8 @@ live（真实网站）
 - **拖拽只覆盖页面内部的元素。** 把资源管理器里的文件拖进网页还不支持（见 Roadmap）。
 - **跨域 iframe 读不到，这是浏览器的同源策略，不是实现偷懒。** 输出里会明确写「N 个跨域 frame 读不到」并列出地址。同源的则完全透明。
 - **iframe 内的元素坐标是"顶层视口坐标"。** 如果 iframe 自己有内部滚动条且内容滚到底了，坐标仍然正确；但如果页面在快照之后滚动了外层容器，`ref` 就要重新取。
+- **下载控制是浏览器级的。** `Browser.setDownloadBehavior` 没有指定 context，所以这个私有浏览器里任何页面发起的下载都会落盘并被记录 —— 即使链接开在新标签页里（那个标签页的**内容**还看不到，见 Roadmap，但文件照样能查到）。
+- **大到超出 `browser_download` 默认 30 秒预算的文件**不会等完 —— 它会如实说「still downloading」，稍后再查即可，文件继续在后台传。
 
 ## Roadmap
 
@@ -155,11 +169,11 @@ live（真实网站）
 - [x] **`browser_upload`**：给隐藏的 `<input type="file">` 直接塞文件
 - [x] **hover / 右键 / 拖拽**：`browser_hover` 报出新出现的元素；右键走 `browser_click {button:"right"}`；`browser_drag` 同时覆盖 pointer 型和原生 HTML5 拖拽
 - [x] **同源 iframe**：快照 / 文字 / 等待 / 点击 / 上传都穿透子框架，坐标自动换算到顶层视口
+- [x] **下载落盘**（`Browser.setDownloadBehavior`）：文件不再被丢弃，每次都报绝对路径，同名不覆盖
 - [ ] **跨域 iframe**：不同域名或端口的框架受同源策略限制，现在只能报出"有 N 个读不到"。要做需要走 `Page.getFrameTree` + 各自执行上下文，属于单独一轮
 - [ ] **桌面平面**：UIA 控件树（文本，不用截图）+ 隔离桌面（`CreateDesktop`）里跑真实输入，让本地软件也能操作而不抢前台 —— 这是 `@copylee` / `windows-mcp` 那套做不到的
 - [ ] 多标签页管理（`Target.createTarget` + sessionId 复用）
 - [ ] 从**系统**拖文件进页面（`Input.dispatchDragEvent`）：现在能拖页面里的元素，还不能把资源管理器里的文件拖进 drop zone
-- [ ] 下载落盘（`Browser.setDownloadBehavior`）
 - [ ] 元素截图裁剪（只发目标区域的图，省 token）
 
 ## 开发
@@ -168,18 +182,19 @@ live（真实网站）
 node tests/load.mjs           # 离线：按 DSH 的严格契约复刻注册校验（改动后先跑这个）
 node tests/tools.mjs          # 工具接线：每个返回值都用自己的 output.schema 校验一遍
 node tests/idle.mjs           # 空闲回收：进程确实会退出
-node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/等待/对话框/上传/导航/hover/拖拽/iframe（20 步）
+node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/等待/对话框/上传/导航/hover/拖拽/iframe/下载（24 步）
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
 ```
 
 `tests/schema.mjs` 是宿主那两个 schema 校验器的唯一副本，`load.mjs` 和 `tools.mjs` 共用它。
 `tests/iframe-fixture.mjs` 起两个真实 HTTP 端口造同源 + 跨域框架——`file://` 页面之间全都是不透明源，用它测同源等于什么都没测。
+`tests/download-fixture.mjs` 也一样：`Content-Disposition` 定名和"下载中的状态"只有真实 HTTP 响应能有，`file://` 触发不了下载。
 
 代码结构：
 
 ```
-lib/cdp.js     零依赖 CDP 客户端 + 私有 Chromium 生命周期
+lib/cdp.js     零依赖 CDP 客户端 + 私有 Chromium 生命周期（含浏览器级下载控制）
 lib/page.js    页面操作（快照 / 点击 / 输入 / 键盘 / 截图 / 文本 / 等待 / 上传 / 跨框架遍历）
 lib/index.js   插件入口：apply(ctx, config) 与工具定义
 tests/         端到端验证
@@ -218,6 +233,10 @@ tests/         端到端验证
 11. **`DOM.requestNode` 之前必须先 `DOM.getDocument`。** 否则它返回 `{ nodeId: 0 }` —— 不报错，看起来成功了，下一步才莫名其妙失败。要拿 iframe 里的元素，只能靠这个组合（`DOM.querySelector` 只查主文档）：`Runtime.evaluate` 遍历子框架返回元素 → 拿 `objectId` → `DOM.requestNode` → `DOM.setFileInputFiles`。跨 frame 的 `objectId` 是可以用的，不用切执行上下文。
 12. **iframe 里元素的 `getBoundingClientRect()` 是相对它自己那个 viewport 的。** 要换算到顶层才有意义：逐层累加 `rect.left + clientLeft`（`clientLeft` 就是 border 宽度，漏了会偏几像素，足够点到旁边那个控件上）。另外**别把 iframe 内部滚动算进去**——`getBoundingClientRect` 已经把内部滚动算完了，再加一次就错。
 13. **`iframe.contentDocument` 跨域时返回 `null` 而不抛错**（旧浏览器会抛）。两种情况都要接住，否则一个广告位就能让整页快照变成空。
+14. **`Browser.setDownloadBehavior` 在浏览器级 target 上，页面 socket 调不到。** 必须再开一条 `/json/version` 的 socket（本插件叫 `browserConnection`，和页面会话互不干扰），并且带上 `eventsEnabled: true`，否则 `Browser.downloadWillBegin` / `downloadProgress` **一个都不会来** —— 文件会落盘，但你无从知道。
+15. **`behavior: "allow"` 会静默覆盖同名文件。** 这一点和日常浏览器的「下载」文件夹不一样：连点两次「导出 CSV」，磁盘上只剩一份，前一份数据被替换掉而且没有任何提示。改用 `allowAndName`（按 guid 存，绝不撞名），完成后再自己 `rename` 成 `report.csv` / `report (1).csv`。
+16. **`downloadProgress` 的 `completed` 早于最终改名几毫秒。** 收到就去找文件会扑空（`existsSync` 为 false，看起来像"文件没下下来"）。所以路径解析是**惰性**的：拿不到就留空，下次读再试；`waitForDownloads` 在收尾时额外给 800ms 重试窗口。
+17. **`allowAndName` 的文件名是 guid，`suggestedFilename` 只在事件里。** 协议从不告诉你最终绝对路径，所以「名字 → 路径」这一步只能自己做。反过来这也意味着：**文件名来自 HTTP 响应头**，写盘前必须自己清洗 `\ / : * ? " < > |`，不能当成可信输入。
 
 ## License
 

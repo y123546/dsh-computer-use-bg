@@ -4,12 +4,13 @@
  * input, reads the result back and writes a screenshot.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { BrowserHost } from '../lib/cdp.js';
+import { ATTR_BODY, HEADER_BODY, SLOW_BYTES, startDownloadSite } from './download-fixture.mjs';
 import { startIframeSites } from './iframe-fixture.mjs';
 import {
   clickAt,
@@ -145,6 +146,9 @@ writeFileSync(uploadFile, 'uploaded by the smoke test\n', 'utf8');
 
 // Frames need real HTTP: see tests/iframe-fixture.mjs for why file:// cannot do it.
 const sites = await startIframeSites();
+// Downloads need it for the same reason: only a real response carries the headers and
+// the slow body that make a download observable.
+const downloadSite = await startDownloadSite();
 
 let failures = 0;
 const ok = (label, detail = '') => console.log(`  PASS  ${label}${detail ? ` — ${detail}` : ''}`);
@@ -153,7 +157,16 @@ const fail = (label, detail = '') => {
   console.log(`  FAIL  ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-const host = new BrowserHost({ port: 9472, headless: true, width: 1280, height: 800 });
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const host = new BrowserHost({
+  port: 9472,
+  headless: true,
+  width: 1280,
+  height: 800,
+  // Keep the test's downloads out of the real plugin folder.
+  downloadDir: join(dir, 'downloads'),
+});
 
 try {
   console.log('1) start private browser');
@@ -450,6 +463,104 @@ try {
     fail('framed file input', error.message);
   }
 
+  console.log('21) a download click lands on disk');
+  const waitForNewDownload = async (countBefore, timeoutMs = 15000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (host.downloads().length > countBefore) break;
+      await sleep(100);
+    }
+    return host.waitForDownloads(10000);
+  };
+
+  let recorded = 0;
+  try {
+    await navigate(conn, downloadSite.url, { timeoutMs: 30000 });
+    const attrLink = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Export report')));
+    if (!attrLink) {
+      fail('find download link', (await snapshot(conn)).elements.map((el) => el.name).join(' | '));
+    } else {
+      await clickAt(conn, attrLink.x, attrLink.y);
+      const list = await waitForNewDownload(recorded);
+      recorded = list.length;
+      const hit = list.find((d) => d.suggestedFilename === 'report.csv');
+      if (!hit) {
+        fail('download recorded', JSON.stringify(list.map((d) => d.suggestedFilename)));
+      } else {
+        if (hit.state === 'completed') ok('download reported completed', hit.suggestedFilename);
+        else fail('download state', hit.state);
+        const onDisk = hit.path && existsSync(hit.path) ? readFileSync(hit.path, 'utf8') : null;
+        if (onDisk === ATTR_BODY) ok('file on disk matches the response', hit.path.split(/[\\/]/).pop());
+        else fail('file content', `${hit.path} -> ${onDisk === null ? 'missing' : JSON.stringify(onDisk)}`);
+      }
+    }
+  } catch (error) {
+    fail('download click', error.message);
+  }
+
+  console.log('22) a second identical download gets its own copy');
+  try {
+    const again = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Export report')));
+    await clickAt(conn, again.x, again.y);
+    const list = await waitForNewDownload(recorded);
+    recorded = list.length;
+    const copies = list.filter((d) => d.suggestedFilename === 'report.csv');
+    const paths = copies.map((d) => d.path).filter(Boolean);
+    if (copies.length === 2 && new Set(paths).size === 2 && paths.every((p) => existsSync(p))) {
+      ok('collision resolved to two distinct files', paths.map((p) => p.split(/[\\/]/).pop()).join(' + '));
+    } else {
+      fail('collision', JSON.stringify({ records: copies.length, paths }));
+    }
+  } catch (error) {
+    fail('second download', error.message);
+  }
+
+  console.log('23) content-disposition decides the file name');
+  try {
+    const headerLink = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Download Q3')));
+    await clickAt(conn, headerLink.x, headerLink.y);
+    const list = await waitForNewDownload(recorded);
+    recorded = list.length;
+    const hit = list.find((d) => d.suggestedFilename === 'q3-report.csv');
+    const body = hit?.path && existsSync(hit.path) ? readFileSync(hit.path, 'utf8') : null;
+    if (body === HEADER_BODY) ok('response header named the file', hit.path.split(/[\\/]/).pop());
+    else fail('content-disposition name', JSON.stringify({ suggested: hit?.suggestedFilename, path: hit?.path }));
+  } catch (error) {
+    fail('header download', error.message);
+  }
+
+  console.log('24) a slow download is visible while it runs, then completes');
+  try {
+    const slowLink = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('big dataset')));
+    await clickAt(conn, slowLink.x, slowLink.y);
+    let during = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      during = host.downloads().find((d) => d.suggestedFilename === 'slow.bin');
+      if (during) break;
+      await sleep(50);
+    }
+    if (during?.state === 'inProgress') {
+      ok('reported as in progress', `${during.receivedBytes}/${during.totalBytes || '?'} bytes`);
+    } else if (during?.state === 'completed') {
+      ok('in-progress state was too brief to observe, but the record exists');
+    } else {
+      fail('slow download recorded', JSON.stringify(during ?? null));
+    }
+
+    const settled = await host.waitForDownloads(20000);
+    const slow = settled.find((d) => d.suggestedFilename === 'slow.bin');
+    const size = slow?.path && existsSync(slow.path) ? statSync(slow.path).size : -1;
+    if (slow?.state === 'completed' && size === SLOW_BYTES) {
+      ok('waitForDownloads returned a complete file', `${slow.path.split(/[\\/]/).pop()} ${size} bytes`);
+    } else {
+      fail('slow download completion', JSON.stringify({ state: slow?.state, size, path: slow?.path }));
+    }
+    recorded = settled.length;
+  } catch (error) {
+    fail('slow download', error.message);
+  }
+
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
   console.log(`artifacts: ${dir}`);
   if (failures > 0) process.exitCode = 1;
@@ -460,4 +571,5 @@ try {
 } finally {
   await host.shutdown().catch(() => {});
   sites.close();
+  downloadSite.close();
 }

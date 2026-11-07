@@ -9,11 +9,12 @@
  * Run with: node tests/tools.mjs
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { ATTR_BODY, startDownloadSite } from './download-fixture.mjs';
 import { startIframeSites } from './iframe-fixture.mjs';
 
 const PORT = 9474;
@@ -113,7 +114,7 @@ const ctx = new Proxy(services, {
 });
 
 const { apply } = await import('../lib/index.js');
-apply(ctx, { port: PORT, headless: true, width: 1440, height: 900, idleMs: 0 });
+apply(ctx, { port: PORT, headless: true, width: 1440, height: 900, idleMs: 0, downloadDir: join(dir, 'downloads') });
 
 const call = async (name, args = {}) => {
   const tool = registered.get(name);
@@ -231,7 +232,43 @@ try {
     sites.close();
   }
 
-  console.log('11) close');
+  console.log('11) a download click is reported where the model will look');
+  const downloadSite = await startDownloadSite();
+  try {
+    await call('browser_open', { url: downloadSite.url, screenshot: false });
+    const clicked = await call('browser_click', { text: 'Export report', screenshot: false });
+    // The whole point: nothing changes on screen, so the note has to ride on the click
+    // result itself. Waiting for a later call would mean the model already concluded
+    // "nothing happened" and clicked again.
+    if (/\(download:/.test(clicked.text) && /report\.csv/.test(clicked.text)) {
+      ok('the click result carries the download note', clicked.text.split('\n').pop().slice(0, 90));
+    } else {
+      fail('download note on the click', clicked.text.split('\n').slice(-2).join(' | '));
+    }
+
+    const listed = await call('browser_download', { wait: true, timeoutMs: 15000 });
+    if (listed.text.includes('report.csv') && listed.text.includes('completed')) {
+      ok('browser_download reports state');
+    } else {
+      fail('browser_download', listed.text.split('\n').slice(0, 6).join(' | '));
+    }
+    const pathLine = listed.text.split('\n').find((row) => row.trim().startsWith('path:'));
+    const target = pathLine ? pathLine.slice(pathLine.indexOf('path:') + 5).trim() : '';
+    if (target && existsSync(target) && readFileSync(target, 'utf8') === ATTR_BODY) {
+      ok('the listed path really holds the file', target.split(/[\\/]/).pop());
+    } else {
+      fail('downloaded file', target || '(no path line)');
+    }
+
+    // A name filter that matches nothing must be a clear answer, not a throw.
+    const none = await call('browser_download', { filename: 'nothing-like-this' });
+    if (none.text.includes('No download in this session matches')) ok('empty filter explained');
+    else fail('empty filter', none.text.split('\n')[0]);
+  } finally {
+    downloadSite.close();
+  }
+
+  console.log('12) close');
   const closed = await call('browser_close');
   if (closed.text.includes('shut down')) ok('close');
   else fail('close', closed.text.slice(0, 120));
