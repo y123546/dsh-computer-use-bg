@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { BrowserHost } from '../lib/cdp.js';
+import { startIframeSites } from './iframe-fixture.mjs';
 import {
   clickAt,
   dragBetween,
@@ -19,6 +20,7 @@ import {
   hoverAt,
   insertText,
   navigate,
+  pageText,
   pressKey,
   reload,
   screenshot,
@@ -140,6 +142,9 @@ const secondUrl = pathToFileURL(secondFile).href;
 
 const uploadFile = join(dir, 'upload-me.txt');
 writeFileSync(uploadFile, 'uploaded by the smoke test\n', 'utf8');
+
+// Frames need real HTTP: see tests/iframe-fixture.mjs for why file:// cannot do it.
+const sites = await startIframeSites();
 
 let failures = 0;
 const ok = (label, detail = '') => console.log(`  PASS  ${label}${detail ? ` — ${detail}` : ''}`);
@@ -370,6 +375,81 @@ try {
     }
   }
 
+  console.log('17) same-origin frame is scanned, cross-origin one is reported');
+  await navigate(conn, sites.outerUrl, { timeoutMs: 20000 });
+
+  // waitFor has to pierce the frame too, so this doubles as its own assertion.
+  const innerReady = await waitFor(conn, { selector: '#inner-btn', timeoutMs: 8000 });
+  if (innerReady.ok) ok('waitFor found an element inside a same-origin frame', `${innerReady.elapsed}ms`);
+  else fail('waitFor through iframe', JSON.stringify(innerReady));
+
+  const framed = await snapshot(conn);
+  const innerBtn = framed.elements.find((el) => el.name.includes('Inner button'));
+  const innerField = framed.elements.find((el) => el.name.includes('Inner name'));
+  const outerBtn = framed.elements.find((el) => el.name.includes('Outer button'));
+  if (innerBtn && innerField && outerBtn) {
+    ok('framed and top-level elements listed together', `${framed.elements.length} total`);
+  } else {
+    fail('snapshot of framed page', JSON.stringify(framed.elements.map((e) => `${e.ref}:${e.name}@${e.frame}`)));
+  }
+  if (innerBtn?.frame === '0' && !outerBtn?.frame) ok('frame path recorded', `inner=${innerBtn?.frame}, outer=top`);
+  else fail('frame path', `inner=${JSON.stringify(innerBtn?.frame)} outer=${JSON.stringify(outerBtn?.frame)}`);
+
+  const blocked = framed.frames?.blocked || [];
+  if (framed.frames?.scanned === 1 && blocked.length === 1) ok('cross-origin frame reported, not thrown', blocked[0]);
+  else fail('cross-origin report', JSON.stringify(framed.frames));
+
+  console.log('18) clicks and typing land inside the frame');
+  if (!innerBtn || !innerField) fail('skip: framed elements missing');
+  else {
+    // Coordinates were translated per frame; the browser's own hit test is what has to
+    // land inside, so reading the flag back out of the child document is the real proof.
+    await clickAt(conn, innerBtn.x, innerBtn.y);
+    await sleep(350);
+    const hit = await evaluate(
+      conn,
+      `document.getElementById('same').contentDocument.defaultView.__innerClicked === true`,
+    );
+    if (hit === true) ok('click landed inside the frame');
+    else fail('click inside frame', JSON.stringify(hit));
+
+    await clickAt(conn, innerField.x, innerField.y);
+    await insertText(conn, 'framed text');
+    const value = await evaluate(
+      conn,
+      `document.getElementById('same').contentDocument.getElementById('inner-name').value`,
+    );
+    if (value === 'framed text') ok('typing reached the framed input', JSON.stringify(value));
+    else fail('typing in frame', JSON.stringify(value));
+  }
+
+  console.log('19) page text spans documents');
+  const spanned = await pageText(conn);
+  if (spanned.includes('[frame 0]') && spanned.includes('Inner heading') && spanned.includes('Outer button')) {
+    ok('text includes the framed document', `${spanned.length} chars`);
+  } else {
+    fail('text spans documents', spanned.slice(0, 200));
+  }
+
+  console.log('20) upload reaches a file input that only exists inside the frame');
+  try {
+    // The selector cannot be resolved from the main document at all, so this only
+    // works if the element is found through the frame walk and then handed to the DOM
+    // agent as a RemoteObject.
+    await setFileInput(conn, { selector: '#inner-file', files: [uploadFile] });
+    const names = await evaluate(
+      conn,
+      `(() => {
+         const el = document.getElementById('same').contentDocument.getElementById('inner-file');
+         return el && el.files ? Array.from(el.files).map((f) => f.name) : null;
+       })()`,
+    );
+    if (Array.isArray(names) && names[0] === 'upload-me.txt') ok('framed file input accepted the file', names.join(', '));
+    else fail('framed file input', JSON.stringify(names));
+  } catch (error) {
+    fail('framed file input', error.message);
+  }
+
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
   console.log(`artifacts: ${dir}`);
   if (failures > 0) process.exitCode = 1;
@@ -379,4 +459,5 @@ try {
   process.exitCode = 1;
 } finally {
   await host.shutdown().catch(() => {});
+  sites.close();
 }

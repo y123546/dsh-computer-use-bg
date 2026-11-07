@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { startIframeSites } from './iframe-fixture.mjs';
+
 const PORT = 9474;
 
 const PAGE = `<!doctype html>
@@ -202,7 +204,34 @@ try {
   if (dndResult.text.trim() === 'dropped:card') ok('the page really received the drop');
   else fail('drop payload', dndResult.text.trim());
 
-  console.log('10) close');
+  console.log('10) snapshot output explains frames');
+  const sites = await startIframeSites();
+  try {
+    await call('browser_open', { url: sites.outerUrl, screenshot: false });
+    const framed = await call('browser_snapshot', { screenshot: false });
+    if (framed.text.includes('(f0)') && framed.text.includes('Inner button')) ok('framed element tagged (f0)');
+    else fail('framed tag', framed.text.split('\n').slice(0, 8).join(' | '));
+    if (framed.text.includes('cross-origin frame(s) cannot be read')) ok('cross-origin warning printed');
+    else fail('cross-origin warning', framed.text.split('\n').slice(0, 8).join(' | '));
+
+    // A ref that lives in the frame must survive the whole chain: locate → translate
+    // the coordinates → click → the child document seeing it.
+    const line = framed.text.split('\n').find((row) => row.includes('Inner button'));
+    const ref = line ? Number((line.match(/^#(\d+)/) || [])[1]) : NaN;
+    if (!Number.isFinite(ref)) fail('parse framed ref', String(line));
+    else {
+      const clicked = await call('browser_click', { ref, screenshot: false });
+      const flag = await call('browser_eval', {
+        expression: `document.getElementById('same').contentDocument.defaultView.__innerClicked === true`,
+      });
+      if (clicked.text.includes('Clicked') && flag.text.trim() === 'true') ok('click by framed ref landed inside');
+      else fail('click by framed ref', `${clicked.text.split('\n')[0]} / flag ${flag.text}`);
+    }
+  } finally {
+    sites.close();
+  }
+
+  console.log('11) close');
   const closed = await call('browser_close');
   if (closed.text.includes('shut down')) ok('close');
   else fail('close', closed.text.slice(0, 120));
