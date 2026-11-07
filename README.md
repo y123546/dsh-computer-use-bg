@@ -60,7 +60,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
     followNewTabs: true     # 点击开出来的新标签页（target=_blank / OAuth 弹窗）自动跟过去
     desktop: true         # 桌面平面（原生窗口）总开关；需要 Python 3
-    pythonPath: ''        # 留空自动找 python / python3 / py -3
+    pythonPath: ''        # 留空自动找：DSH 自带的 python → python → python3 → py -3
     desktopIsolated: true # desktop_launch 默认把程序放到隔离桌面（看不见、抢不到焦点）
     shotDir: ''           # 留空用 <DSH_HOME>/dsh-computer-use-bg/shots
     enabled: true         # false = 一个工具都不注册（硬开关）
@@ -160,7 +160,9 @@ desktop_act  { action:"read", target } → 读回来，确认真的写进去了
 
 **能看到什么**：经典 Win32 控件（记事本的编辑框、系统对话框的按钮、资源管理器的部分控件）。现代应用（Chromium / WPF / Electron）整窗自绘，控件树是空的——这时用 `desktop_shot` 看图 + `x`/`y` 点击。真正的 UIA 语义树（能读出 Word 的段落、微信的会话列表）是另一件事，见 Roadmap。
 
-**为什么是 Python**：UIA 那条路（.NET `UIAutomationClient`）控件树更丰富，但开发环境里 `Add-Type` 一类调用被沙箱拦死，**一条命令都验证不了**。与其交付一堆没跑过的自动化代码，不如用一条每条断言都实跑过的路。缺 Python 3 时桌面平面自己报"不可用"，浏览器侧照常工作（`desktop: false` 可以彻底关掉）。
+**为什么是 Python**：UIA 那条路（.NET `UIAutomationClient`）控件树更丰富，但开发环境里 `Add-Type` 一类调用被沙箱拦死，**一条命令都验证不了**。与其交付一堆没跑过的自动化代码，不如用一条每条断言都实跑过的路。
+
+**不用你装 Python。** 探测顺序是：`pythonPath` 配置 → `DSH_BG_CU_PYTHON` 环境变量 → **DSH 自带的运行时**（`<DSH_HOME>/dsh-runtimes/*/dependencies/python/python.exe`，实测 3.12）→ `python` / `python3` / `py -3`。每个候选都要**真的跑一次** `import ctypes` 才算数——Windows 上 `python` 常常是应用商店的占位程序，它存在、它能运行、它打印的是广告。都不行时才报"不可用"，浏览器侧照常工作（`desktop: false` 可以彻底关掉）。
 
 ## 验证
 
