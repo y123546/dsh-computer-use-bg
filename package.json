@@ -1,0 +1,43 @@
+{
+  "name": "dsh-computer-use-bg",
+  "version": "0.1.0",
+  "description": "Background computer use for DeepSeek Harness: drive a private Chromium over CDP without stealing your mouse, keyboard or focus.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/*.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "computer-use",
+    "browser-automation",
+    "cdp",
+    "cordis"
+  ],
+  "license": "MIT"
+}
