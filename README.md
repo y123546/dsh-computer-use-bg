@@ -76,9 +76,18 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_wait` | 等条件成立：元素出现 / 文字出现 / 元素消失 / 加载完成。比固定 sleep 稳，超时会告诉你页面实际长什么样 |
 | `browser_nav` | 前进 / 后退 / 刷新。到边界会明确报错，不会假装成功 |
 | `browser_upload` | 给 `<input type="file">` 塞本地文件，不弹系统选择框（输入框是隐藏的也能塞） |
+| `browser_hover` | 悬停后告诉模型**新出现了什么**（下拉菜单、tooltip），并给这些新元素的 `ref`，接着就能点 |
+| `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
+
+**右键**用 `browser_click { "button": "right" }`。它触发的是页面的 `contextmenu`（web app 自己的菜单会正常弹出）；浏览器原生的那个菜单在无窗口模式下不渲染，也点不到——真要操作它请改 `headless: false`。
+
+**拖拽**有两种互不相干的机制，工具会自己分辨并在结果里说明：
+
+- `pointermove` 型（dnd-kit / SortableJS / 所有滑块）：中间要发足够多的 `mouseMoved`，一次从 A 跳到 B 会被当成没动。默认 14 步，库不认就调大 `steps`。
+- 原生 HTML5（`draggable="true"`）：`dragstart` / `dragover` / `drop`。**目标必须自己处理 `dragover` 并 `preventDefault()`**，否则永远收不到 `drop`——结果里会明确写「起了个 drag 但没有 drop」，而不是假装成功。
 
 `alert` / `confirm` / `prompt` 会**自动应答**（默认 accept），否则渲染器会卡死、后面每条命令都超时。被应答的对话框会附在下一次工具结果的末尾，例如 `(dialog handled automatically: confirm("sure?") — accepted)` —— 不会悄悄吞掉。要改成 dismiss，见下面的 `dialogBehavior`。
 
@@ -129,6 +138,8 @@ live（真实网站）
 - **无窗口就意味着你看不到过程。** 想确认它点了哪儿，用 `browser_snapshot`（默认带截图，只是它落在对话里而不是屏幕上）；想全程盯着看，把 `headless` 改成 `false`。
 - **空闲会自动关闭。** 默认 5 分钟无操作后杀掉浏览器进程，下次调用重新拉起（冷启动约 7 秒）。要常驻就把 `idleMs` 设成 `0`。
 - **`browser_eval` 能执行任意 JS。** 只在你信任的页面上用。
+- **`browser_hover` 的「新出现了什么」靠对比两次元素快照。** 画在 canvas 里、或者只改了自己尺寸而没有新 DOM 元素的弹层（少数老式编辑器）看不到，这时候改用坐标 + 截图判断。
+- **拖拽只覆盖页面内部的元素。** 把资源管理器里的文件拖进网页还不支持（见 Roadmap）。
 
 ## Roadmap
 
@@ -136,13 +147,13 @@ live（真实网站）
 - [x] **`browser_wait`**：等元素 / 文字 / 消失 / 加载完成，替代固定 sleep
 - [x] **`browser_nav`**：reload / back / forward，到边界明确报错
 - [x] **`browser_upload`**：给隐藏的 `<input type="file">` 直接塞文件
+- [x] **hover / 右键 / 拖拽**：`browser_hover` 报出新出现的元素；右键走 `browser_click {button:"right"}`；`browser_drag` 同时覆盖 pointer 型和原生 HTML5 拖拽
 - [ ] **桌面平面**：UIA 控件树（文本，不用截图）+ 隔离桌面（`CreateDesktop`）里跑真实输入，让本地软件也能操作而不抢前台 —— 这是 `@copylee` / `windows-mcp` 那套做不到的
 - [ ] iframe / 跨域 frame：现在只能看到主框架，嵌入的支付、编辑器、验证码读不到
 - [ ] 多标签页管理（`Target.createTarget` + sessionId 复用）
-- [ ] hover / 右键菜单 / 拖拽
+- [ ] 从**系统**拖文件进页面（`Input.dispatchDragEvent`）：现在能拖页面里的元素，还不能把资源管理器里的文件拖进 drop zone
 - [ ] 下载落盘（`Browser.setDownloadBehavior`）
 - [ ] 元素截图裁剪（只发目标区域的图，省 token）
-- [ ] 只接受 drag 事件的 drop zone（`Input.dispatchDragEvent`）
 
 ## 开发
 

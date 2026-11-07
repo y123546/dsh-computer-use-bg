@@ -22,6 +22,40 @@ const PAGE = `<!doctype html>
 <button id="go" aria-label="Go now" onclick="document.getElementById('out').textContent='went'">Go now</button>
 <p id="out">idle</p>
 <input id="file" type="file" style="display:none">
+<div id="menu-host" style="position:relative;display:inline-block">
+  <button id="mtrigger" aria-label="Open menu">Open menu</button>
+  <div id="hmenu" role="menu" style="position:absolute;left:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5">
+    <button id="mp1" aria-label="Profile item" onclick="window.__profileClicked = true">Profile item</button>
+    <button id="mp2" aria-label="Sign out item">Sign out item</button>
+  </div>
+</div>
+<style>
+  /* Table rule, not an inline style: inline display:none would outrank :hover and the
+     test would then measure the CSS, not the gesture. */
+  #hmenu { display: none; }
+  #menu-host:hover #hmenu { display: block; }
+</style>
+<div id="cardx" draggable="true" role="button" aria-label="Draggable card" style="width:90px;height:36px;background:#cde">Card</div>
+<div id="zonex" role="button" aria-label="Drop zone" style="width:180px;height:50px;background:#eee">Drop here</div>
+<p id="dnd">none</p>
+<script>
+  (() => {
+    const card = document.getElementById('cardx');
+    const zone = document.getElementById('zonex');
+    card.addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'card');
+      event.dataTransfer.effectAllowed = 'move';
+    });
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+    });
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      document.getElementById('dnd').textContent = 'dropped:' + event.dataTransfer.getData('text/plain');
+    });
+  })();
+</script>
 <p id="later"></p>
 <script>
   setTimeout(() => {
@@ -142,7 +176,33 @@ try {
   if (badAction && badAction.includes('reload / back / forward')) ok('bad action explained');
   else fail('bad action', String(badAction));
 
-  console.log('7) close');
+  console.log('7) hover reports only what the hover revealed');
+  const hovered = await call('browser_hover', { text: 'Open menu', screenshot: false });
+  if (hovered.text.includes('Appeared after hovering (2)')) ok('hover diff counted 2 new elements');
+  else fail('hover diff', hovered.text.split('\n').slice(0, 6).join(' | '));
+  if (hovered.text.includes('Profile item')) ok('revealed item is listed with a ref');
+  else fail('revealed item listed', hovered.text.slice(0, 200));
+  // The point of hovering is that the next click can land on the popup, so prove the
+  // revealed element is actually clickable instead of just printed.
+  const popupClick = await call('browser_click', { text: 'Profile item', screenshot: false });
+  const clickedFlag = await call('browser_eval', { expression: 'window.__profileClicked === true' });
+  if (popupClick.text.includes('Clicked') && clickedFlag.text.trim() === 'true') ok('clicking the revealed item works');
+  else fail('click revealed item', `${popupClick.text.split('\n')[0]} / flag ${clickedFlag.text}`);
+
+  console.log('8) hover on something with no popup says so');
+  const idleHover = await call('browser_hover', { text: 'Go now', screenshot: false });
+  if (idleHover.text.includes('Nothing new appeared')) ok('empty diff explained');
+  else fail('empty diff', idleHover.text.split('\n').slice(0, 4).join(' | '));
+
+  console.log('9) drag names the drag family it found');
+  const dragged = await call('browser_drag', { text: 'Draggable card', toText: 'Drop zone', screenshot: false });
+  if (dragged.text.includes('Native HTML5 drag and drop, and the drop landed')) ok('HTML5 drag recognised');
+  else fail('drag verdict', dragged.text.split('\n').slice(0, 4).join(' | '));
+  const dndResult = await call('browser_eval', { expression: "document.getElementById('dnd').textContent" });
+  if (dndResult.text.trim() === 'dropped:card') ok('the page really received the drop');
+  else fail('drop payload', dndResult.text.trim());
+
+  console.log('10) close');
   const closed = await call('browser_close');
   if (closed.text.includes('shut down')) ok('close');
   else fail('close', closed.text.slice(0, 120));

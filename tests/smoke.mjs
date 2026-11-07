@@ -12,8 +12,11 @@ import { pathToFileURL } from 'node:url';
 import { BrowserHost } from '../lib/cdp.js';
 import {
   clickAt,
+  dragBetween,
+  dragProbe,
   evaluate,
   goHistory,
+  hoverAt,
   insertText,
   navigate,
   pressKey,
@@ -34,6 +37,60 @@ const HTML = `<!doctype html>
   }
 </script>
 <h1>Smoke test</h1>
+<div id="ctx-zone" role="button" aria-label="Right-click area" style="width:200px;height:40px;background:#eef;line-height:40px">Right-click area</div>
+<div id="ctx-menu" style="display:none">
+  <button id="ctx-delete" aria-label="Delete row">Delete row</button>
+</div>
+<div id="slider-track" style="width:300px;height:40px;background:#eee;position:relative;margin:8px 0">
+  <div id="slider-thumb" role="button" aria-label="Thumb" style="width:40px;height:40px;background:#333;position:absolute;left:0;top:0"></div>
+</div>
+<p id="slider-out">0</p>
+<div id="card" draggable="true" role="button" aria-label="Draggable card" style="width:100px;height:40px;background:#cde">Card</div>
+<div id="dropzone" role="button" aria-label="Drop zone" style="width:200px;height:60px;background:#eee">Drop here</div>
+<p id="dnd-out">none</p>
+<script>
+  // Right-click: a page-owned context menu, the way web apps replace the native one.
+  document.getElementById('ctx-zone').addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    window.__ctxFired = (window.__ctxFired || 0) + 1;
+    document.getElementById('ctx-menu').style.display = 'block';
+  });
+  document.getElementById('ctx-delete').addEventListener('click', () => { window.__ctxDeleted = true; });
+
+  // Pointer-driven drag: what dnd-kit / SortableJS / every slider looks like to CDP.
+  (() => {
+    const track = document.getElementById('slider-track');
+    const thumb = document.getElementById('slider-thumb');
+    let dragging = false;
+    thumb.addEventListener('pointerdown', () => { dragging = true; });
+    track.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      const rect = track.getBoundingClientRect();
+      const left = Math.max(0, Math.min(rect.width - 40, event.clientX - rect.left - 20));
+      thumb.style.left = left + 'px';
+      document.getElementById('slider-out').textContent = String(Math.round(left));
+    });
+    track.addEventListener('pointerup', () => { if (dragging) window.__pointerDropped = true; dragging = false; });
+  })();
+
+  // Native HTML5 drag: a different event family entirely, so it needs its own check.
+  (() => {
+    const card = document.getElementById('card');
+    const zone = document.getElementById('dropzone');
+    card.addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'card');
+      event.dataTransfer.effectAllowed = 'move';
+    });
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+    });
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      document.getElementById('dnd-out').textContent = 'dropped:' + event.dataTransfer.getData('text/plain');
+    });
+  })();
+</script>
 <button id="press" aria-label="Press me" onclick="document.getElementById('out').textContent='clicked'">Press me</button>
 <p id="out">idle</p>
 <input id="name" aria-label="Name field" placeholder="Name">
@@ -42,6 +99,19 @@ const HTML = `<!doctype html>
 <button id="alert" aria-label="Show alert" onclick="alert('hello from smoke')">Show alert</button>
 <button id="confirm" aria-label="Ask confirm" onclick="window.__confirmed = confirm('sure?')">Ask confirm</button>
 <input id="file" type="file" style="display:none" aria-label="Hidden file input">
+<div id="menu-host" style="position:relative;display:inline-block;margin-top:8px">
+  <button id="hover-trigger" aria-label="Open menu">Open menu</button>
+  <div id="hover-menu" role="menu" style="position:absolute;left:0;top:100%;background:#fff;border:1px solid #ccc;z-index:10">
+    <button id="menu-profile" aria-label="Profile item">Profile item</button>
+    <button id="menu-signout" aria-label="Sign out item">Sign out item</button>
+  </div>
+</div>
+<style>
+  /* Not inline: an inline display:none outranks any :hover rule, which would make
+     this test pass or fail for a reason that has nothing to do with the gesture. */
+  #hover-menu { display: none; }
+  #menu-host:hover #hover-menu { display: block; }
+</style>
 <div id="late"></div>
 <script>
   setTimeout(() => {
@@ -216,6 +286,89 @@ try {
   else fail('forward past the end should have thrown');
 
   await navigate(conn, url, { timeoutMs: 20000 });
+
+  console.log('13) hover opens a menu that is display:none before it');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const trigger = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Open menu')));
+  if (!trigger) fail('find hover trigger');
+  else {
+    const hidden = await evaluate(conn, `getComputedStyle(document.getElementById('hover-menu')).display`);
+    const before = await snapshot(conn);
+    await hoverAt(conn, trigger.x, trigger.y);
+    await sleep(400);
+    const shown = await evaluate(conn, `getComputedStyle(document.getElementById('hover-menu')).display`);
+    const after = await snapshot(conn);
+    const appeared = after.elements.filter(
+      (el) => el.name.includes('Profile item') || el.name.includes('Sign out item'),
+    );
+    if (hidden === 'none' && shown === 'block' && appeared.length === 2) {
+      ok('hover revealed the menu', `${before.elements.length} -> ${after.elements.length} elements`);
+    } else {
+      fail('hover revealed the menu', `display ${hidden} -> ${shown}, appeared ${appeared.length}`);
+    }
+    // Move away again so the open menu cannot cover the blocks tested below.
+    await hoverAt(conn, 2, 2);
+    const closed = await evaluate(conn, `getComputedStyle(document.getElementById('hover-menu')).display`);
+    if (closed === 'none') ok('menu closes when the pointer leaves');
+    else fail('menu closes', `still ${closed}`);
+  }
+
+  console.log('14) right click fires contextmenu');
+  const zone = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Right-click area')));
+  if (!zone) fail('find right-click area');
+  else {
+    await clickAt(conn, zone.x, zone.y, { button: 'right' });
+    await sleep(350);
+    const fired = await evaluate(conn, 'window.__ctxFired || 0');
+    const menu = await evaluate(conn, `getComputedStyle(document.getElementById('ctx-menu')).display`);
+    if (fired >= 1 && menu === 'block') ok('right click opened the page menu', `contextmenu x${fired}`);
+    else fail('right click', `contextmenu x${fired}, menu ${menu}`);
+
+    const del = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Delete row')));
+    if (!del) fail('find context menu item');
+    else {
+      await clickAt(conn, del.x, del.y);
+      await sleep(300);
+      const deleted = await evaluate(conn, 'window.__ctxDeleted === true');
+      if (deleted) ok('clicking the context menu item works');
+      else fail('context menu item click');
+      await evaluate(conn, `document.getElementById('ctx-menu').style.display = 'none'`);
+    }
+  }
+
+  console.log('15) pointer drag moves a slider thumb');
+  const thumb = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Thumb')));
+  if (!thumb) fail('find slider thumb');
+  else {
+    const right = await evaluate(
+      conn,
+      `(() => { const r = document.getElementById('slider-track').getBoundingClientRect(); return { x: Math.round(r.right - 25), y: Math.round(r.top + r.height / 2) }; })()`,
+    );
+    await dragProbe(conn);
+    await dragBetween(conn, { x: thumb.x, y: thumb.y }, right, { steps: 16 });
+    await sleep(300);
+    const left = await evaluate(conn, `document.getElementById('slider-thumb').style.left`);
+    const dropped = await evaluate(conn, 'window.__pointerDropped === true');
+    if (parseInt(left, 10) > 100 && dropped) ok('thumb moved', `left ${left}`);
+    else fail('pointer drag', `left ${left}, pointerup seen: ${dropped}`);
+  }
+
+  console.log('16) native HTML5 drag and drop');
+  const card = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Draggable card')));
+  const dropzone = await snapshot(conn).then((s) => s.elements.find((el) => el.name.includes('Drop zone')));
+  if (!card || !dropzone) fail('find drag pair');
+  else {
+    await dragProbe(conn);
+    await dragBetween(conn, { x: card.x, y: card.y }, { x: dropzone.x, y: dropzone.y }, { steps: 20 });
+    await sleep(400);
+    const seen = await dragProbe(conn);
+    const result = await evaluate(conn, `document.getElementById('dnd-out').textContent`);
+    if (result === 'dropped:card') {
+      ok('HTML5 drop landed', `dragstart ${seen.dragstart}, drop ${seen.drop}, dragenter ${seen.dragenter}`);
+    } else {
+      fail('HTML5 drop', `dnd-out=${JSON.stringify(result)} probe=${JSON.stringify(seen)}`);
+    }
+  }
 
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
   console.log(`artifacts: ${dir}`);

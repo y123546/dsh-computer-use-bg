@@ -123,7 +123,7 @@ check(
 
 apply(makeCtx({ withAttachments: true }), {});
 
-check('13 tools registered', registered.length === 13, `got ${registered.length}: ${registered.map((t) => t.name).join(', ')}`);
+check('15 tools registered', registered.length === 15, `got ${registered.length}: ${registered.map((t) => t.name).join(', ')}`);
 check('every tool has parameters', registered.every((t) => t.parameters && typeof t.parameters === 'object'));
 check('every tool has execute', registered.every((t) => typeof t.execute === 'function'));
 check('every tool has a description', registered.every((t) => typeof t.description === 'string' && t.description.length > 10));
@@ -185,6 +185,8 @@ const expected = [
   'browser_wait',
   'browser_nav',
   'browser_upload',
+  'browser_hover',
+  'browser_drag',
   'browser_close',
 ];
 const got = registered.map((t) => t.name);
@@ -194,7 +196,7 @@ check('expected tool set', expected.every((n) => got.includes(n)), got.join(', '
 const bareSink = [];
 try {
   apply(makeCtx({ withAttachments: false, sink: bareSink }), {});
-  check('loads on a host without attachments', bareSink.length === 13, `got ${bareSink.length} tools`);
+  check('loads on a host without attachments', bareSink.length === 15, `got ${bareSink.length} tools`);
 } catch (error) {
   check('loads on a host without attachments', false, error.message);
 }
