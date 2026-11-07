@@ -58,6 +58,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
     timeoutMs: 25000      # 冷启动等待上限
     dialogBehavior: accept  # accept | dismiss —— alert/confirm/prompt 怎么自动应答
     dialogPromptText: ''    # dialogBehavior=accept 时，prompt() 返回的默认文字
+    followNewTabs: true     # 点击开出来的新标签页（target=_blank / OAuth 弹窗）自动跟过去
     enabled: true         # false = 一个工具都不注册（硬开关）
 ```
 
@@ -76,10 +77,13 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_eval` | 在页面里跑 JS，读结构化数据（表格、内嵌 JSON） |
 | `browser_wait` | 等条件成立：元素出现 / 文字出现 / 元素消失 / 加载完成。比固定 sleep 稳，超时会告诉你页面实际长什么样 |
 | `browser_nav` | 前进 / 后退 / 刷新。到边界会明确报错，不会假装成功 |
+| `browser_tabs` | 标签页：列出 / 新建 / 切换 / 关闭。点击开出来的新标签页会自动跟过去 |
 | `browser_upload` | 给 `<input type="file">` 塞本地文件，不弹系统选择框（输入框是隐藏的也能塞） |
+| `browser_drop_files` | 把**磁盘上的文件**拖进页面的 drop zone（`DataTransfer.files` 是真的文件） |
 | `browser_download` | 看这次会话下载了什么、文件落在哪个绝对路径；`wait: true` 等到传输结束 |
 | `browser_hover` | 悬停后告诉模型**新出现了什么**（下拉菜单、tooltip），并给这些新元素的 `ref`，接着就能点 |
 | `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
+| `browser_screenshot` | 只截一个元素或一块区域。比整屏省一个量级的图片 token，看小字还可以 `scale: 2` |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用） |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
@@ -94,6 +98,19 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 
 - `pointermove` 型（dnd-kit / SortableJS / 所有滑块）：中间要发足够多的 `mouseMoved`，一次从 A 跳到 B 会被当成没动。默认 14 步，库不认就调大 `steps`。
 - 原生 HTML5（`draggable="true"`）：`dragstart` / `dragover` / `drop`。**目标必须自己处理 `dragover` 并 `preventDefault()`**，否则永远收不到 `drop`——结果里会明确写「起了个 drag 但没有 drop」，而不是假装成功。
+
+**从系统拖文件进页面**用 `browser_drop_files`：拖的是真实磁盘路径，`DataTransfer.files` 里是文件本体（名字、大小、内容都对），所以「拖张图进来上传」这类控件也能用。目标同样得接得住——`dragover` 里不 `preventDefault()` 的 div 会被浏览器直接拒收，结果会写「没有 drop 事件到页面」。有真正的 `<input type="file">` 时优先用 `browser_upload`，那条路更稳。
+
+**多标签页**：`target="_blank"`、OAuth 弹窗、`window.open` 都会开新标签页，而页面级 CDP 会话不会自己跟过去——点击看起来就"什么都没发生"。插件每次调用后对比一次标签页集合，发现新的就**自动跟过去**，并在结果末尾说明：
+
+```
+(new tab opened and is now the active tab: "popup page" — file:///.../popup.html, id 8F3C....
+ The element list above belongs to the page you just left — those refs are stale now, so call browser_snapshot to read this tab.)
+```
+
+不想要这个行为就设 `followNewTabs: false`，再自己 `browser_tabs { "action": "select" }`。浏览器自己的界面（`edge://downloads-hub`、`chrome://settings`）**不算标签页**：不列出来、也不跟随——Edge 每次下载都会开一个，跟过去等于把会话从网站上拽走。
+
+**只截一块**用 `browser_screenshot`，四种给法：`ref` / `text` / `selector` / `x,y,width,height`。它会先把目标滚到视口中央再截，所以**坐标会变**（结果里会写滚到哪了）；区域超出视口会被裁到可见部分并明确说明，而不是塞给你一张灰图。看小字加 `scale: 2`。
 
 `alert` / `confirm` / `prompt` 会**自动应答**（默认 accept），否则渲染器会卡死、后面每条命令都超时。被应答的对话框会附在下一次工具结果的末尾，例如 `(dialog handled automatically: confirm("sure?") — accepted)` —— 不会悄悄吞掉。要改成 dismiss，见下面的 `dialogBehavior`。
 
@@ -155,11 +172,12 @@ live（真实网站）
 - **空闲会自动关闭。** 默认 5 分钟无操作后杀掉浏览器进程，下次调用重新拉起（冷启动约 7 秒）。要常驻就把 `idleMs` 设成 `0`。
 - **`browser_eval` 能执行任意 JS。** 只在你信任的页面上用。
 - **`browser_hover` 的「新出现了什么」靠对比两次元素快照。** 画在 canvas 里、或者只改了自己尺寸而没有新 DOM 元素的弹层（少数老式编辑器）看不到，这时候改用坐标 + 截图判断。
-- **拖拽只覆盖页面内部的元素。** 把资源管理器里的文件拖进网页还不支持（见 Roadmap）。
+- **拖拽只覆盖页面内部的元素。** 从资源管理器拖文件进网页要单独用 `browser_drop_files`（它靠 CDP 的 drag 通道带真实路径，不是鼠标手势）；纯鼠标拖拽做不了这件事。
 - **跨域 iframe 读不到，这是浏览器的同源策略，不是实现偷懒。** 输出里会明确写「N 个跨域 frame 读不到」并列出地址。同源的则完全透明。
 - **iframe 内的元素坐标是"顶层视口坐标"。** 如果 iframe 自己有内部滚动条且内容滚到底了，坐标仍然正确；但如果页面在快照之后滚动了外层容器，`ref` 就要重新取。
-- **下载控制是浏览器级的。** `Browser.setDownloadBehavior` 没有指定 context，所以这个私有浏览器里任何页面发起的下载都会落盘并被记录 —— 即使链接开在新标签页里（那个标签页的**内容**还看不到，见 Roadmap，但文件照样能查到）。
+- **下载控制是浏览器级的。** `Browser.setDownloadBehavior` 没有指定 context，所以这个私有浏览器里任何页面发起的下载都会落盘并被记录，包括开在新标签页里的链接——那个标签页现在也能直接读（`browser_tabs`）。
 - **大到超出 `browser_download` 默认 30 秒预算的文件**不会等完 —— 它会如实说「still downloading」，稍后再查即可，文件继续在后台传。
+- **浏览器自己的界面页不算标签页。** `edge://`、`chrome://` 这类地址不列在 `browser_tabs` 里、也不会被自动跟随：那是浏览器 UI，不是网页，驱动它没有意义。它们照样占着一个真实标签页，所以「标签页数量」可能比你看到的多。
 
 ## Roadmap
 
@@ -170,11 +188,11 @@ live（真实网站）
 - [x] **hover / 右键 / 拖拽**：`browser_hover` 报出新出现的元素；右键走 `browser_click {button:"right"}`；`browser_drag` 同时覆盖 pointer 型和原生 HTML5 拖拽
 - [x] **同源 iframe**：快照 / 文字 / 等待 / 点击 / 上传都穿透子框架，坐标自动换算到顶层视口
 - [x] **下载落盘**（`Browser.setDownloadBehavior`）：文件不再被丢弃，每次都报绝对路径，同名不覆盖
+- [x] **多标签页**（`browser_tabs` + 每次调用后对比 target 集合）：`target=_blank` / OAuth 弹窗自动跟随，列表 / 新建 / 切换 / 关闭齐全
+- [x] **从系统拖文件进页面**（`Input.dispatchDragEvent` + `files`）：`DataTransfer.files` 里是真实文件，名字和大小都对
+- [x] **元素截图裁剪**（`Page.captureScreenshot` + `clip`）：按 ref / 选择器 / 区域出图，`scale` 可放大
 - [ ] **跨域 iframe**：不同域名或端口的框架受同源策略限制，现在只能报出"有 N 个读不到"。要做需要走 `Page.getFrameTree` + 各自执行上下文，属于单独一轮
 - [ ] **桌面平面**：UIA 控件树（文本，不用截图）+ 隔离桌面（`CreateDesktop`）里跑真实输入，让本地软件也能操作而不抢前台 —— 这是 `@copylee` / `windows-mcp` 那套做不到的
-- [ ] 多标签页管理（`Target.createTarget` + sessionId 复用）
-- [ ] 从**系统**拖文件进页面（`Input.dispatchDragEvent`）：现在能拖页面里的元素，还不能把资源管理器里的文件拖进 drop zone
-- [ ] 元素截图裁剪（只发目标区域的图，省 token）
 
 ## 开发
 
@@ -182,7 +200,7 @@ live（真实网站）
 node tests/load.mjs           # 离线：按 DSH 的严格契约复刻注册校验（改动后先跑这个）
 node tests/tools.mjs          # 工具接线：每个返回值都用自己的 output.schema 校验一遍
 node tests/idle.mjs           # 空闲回收：进程确实会退出
-node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/等待/对话框/上传/导航/hover/拖拽/iframe/下载（24 步）
+node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/裁剪/等待/对话框/上传/导航/hover/拖拽/拖文件/iframe/下载/标签页（27 步）
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
 ```
@@ -190,12 +208,13 @@ node tests/live.mjs https://github.com
 `tests/schema.mjs` 是宿主那两个 schema 校验器的唯一副本，`load.mjs` 和 `tools.mjs` 共用它。
 `tests/iframe-fixture.mjs` 起两个真实 HTTP 端口造同源 + 跨域框架——`file://` 页面之间全都是不透明源，用它测同源等于什么都没测。
 `tests/download-fixture.mjs` 也一样：`Content-Disposition` 定名和"下载中的状态"只有真实 HTTP 响应能有，`file://` 触发不了下载。
+`tests/png.mjs` 是给测试用的最小 PNG 解码器：裁剪截图对不对只能看**像素**（长度和尺寸都能骗人）。
 
 代码结构：
 
 ```
-lib/cdp.js     零依赖 CDP 客户端 + 私有 Chromium 生命周期（含浏览器级下载控制）
-lib/page.js    页面操作（快照 / 点击 / 输入 / 键盘 / 截图 / 文本 / 等待 / 上传 / 跨框架遍历）
+lib/cdp.js     零依赖 CDP 客户端 + 私有 Chromium 生命周期（含浏览器级下载控制、标签页管理）
+lib/page.js    页面操作（快照 / 点击 / 输入 / 键盘 / 截图与裁剪 / 文本 / 等待 / 上传 / 拖文件 / 跨框架遍历）
 lib/index.js   插件入口：apply(ctx, config) 与工具定义
 tests/         端到端验证
 ```
@@ -233,6 +252,11 @@ tests/         端到端验证
 11. **`DOM.requestNode` 之前必须先 `DOM.getDocument`。** 否则它返回 `{ nodeId: 0 }` —— 不报错，看起来成功了，下一步才莫名其妙失败。要拿 iframe 里的元素，只能靠这个组合（`DOM.querySelector` 只查主文档）：`Runtime.evaluate` 遍历子框架返回元素 → 拿 `objectId` → `DOM.requestNode` → `DOM.setFileInputFiles`。跨 frame 的 `objectId` 是可以用的，不用切执行上下文。
 12. **iframe 里元素的 `getBoundingClientRect()` 是相对它自己那个 viewport 的。** 要换算到顶层才有意义：逐层累加 `rect.left + clientLeft`（`clientLeft` 就是 border 宽度，漏了会偏几像素，足够点到旁边那个控件上）。另外**别把 iframe 内部滚动算进去**——`getBoundingClientRect` 已经把内部滚动算完了，再加一次就错。
 13. **`iframe.contentDocument` 跨域时返回 `null` 而不抛错**（旧浏览器会抛）。两种情况都要接住，否则一个广告位就能让整页快照变成空。
+14. **`Page.captureScreenshot` 的 `clip` 是文档坐标，不是视口坐标。** 把 `getBoundingClientRect()` 的结果直接当 clip 传进去，会得到一张尺寸完全正确、内容纯白/纯灰的图 —— 不报错，看起来像"页面就是这么白"。必须先 `+ scrollX/scrollY`。`tests/smoke.mjs` 第 26 步专门解 PNG 验中心像素，就是为了钉住这一条。
+15. **Edge 每次下载都会顺手开一个 `edge://downloads-hub/` 标签页。** 如果"有新标签页就跟过去"，点完导出整个会话就被拽到浏览器 UI 上，网站其实还在，但工具看着它、却读不到任何东西。所以 `listTabs()` 明确过滤 `edge:/chrome:/chrome-untrusted:` 这类 scheme —— 既不在列表里出现，也不参与跟随。
+16. **浏览器级 socket 只能武装一次。** 冷启动会重新走 `#start()`，每次都 `Browser.setDownloadBehavior` 的话，旧 socket 不会自己关（泄漏），而且下载事件会重复计一份。现在只在 `browserConnection` 为空或已关闭时才重新武装。
+17. **页面级 socket 收不到"新标签页"事件。** `Target.targetCreated` 只在浏览器级 socket 上，页面级只能看到自己被换了文档。所以跟随是靠**对比 target 集合**做的：每次工具调用后 `GET /json/list`，id 不在上次集合里的就是刚开出来的。
+18. **关掉正在驱动的标签页会让会话悬空。** socket 会 `close`，之后每条命令都报 "CDP socket is closed"。`closeTab` 必须在自己关掉连接后挑一个还活着的标签页接上（一个都没有就新建），否则用户从此只能重启插件。
 14. **`Browser.setDownloadBehavior` 在浏览器级 target 上，页面 socket 调不到。** 必须再开一条 `/json/version` 的 socket（本插件叫 `browserConnection`，和页面会话互不干扰），并且带上 `eventsEnabled: true`，否则 `Browser.downloadWillBegin` / `downloadProgress` **一个都不会来** —— 文件会落盘，但你无从知道。
 15. **`behavior: "allow"` 会静默覆盖同名文件。** 这一点和日常浏览器的「下载」文件夹不一样：连点两次「导出 CSV」，磁盘上只剩一份，前一份数据被替换掉而且没有任何提示。改用 `allowAndName`（按 guid 存，绝不撞名），完成后再自己 `rename` 成 `report.csv` / `report (1).csv`。
 16. **`downloadProgress` 的 `completed` 早于最终改名几毫秒。** 收到就去找文件会扑空（`existsSync` 为 false，看起来像"文件没下下来"）。所以路径解析是**惰性**的：拿不到就留空，下次读再试；`waitForDownloads` 在收尾时额外给 800ms 重试窗口。

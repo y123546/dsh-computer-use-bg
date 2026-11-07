@@ -16,6 +16,8 @@ import {
   clickAt,
   dragBetween,
   dragProbe,
+  dropFilesAt,
+  elementBox,
   evaluate,
   goHistory,
   hoverAt,
@@ -25,10 +27,12 @@ import {
   pressKey,
   reload,
   screenshot,
+  screenshotRegion,
   setFileInput,
   snapshot,
   waitFor,
 } from '../lib/page.js';
+import { isRed, readPng } from './png.mjs';
 
 const HTML = `<!doctype html>
 <meta charset="utf-8">
@@ -124,6 +128,30 @@ const HTML = `<!doctype html>
     document.getElementById('late').appendChild(ready);
   }, 1200);
 </script>
+<!-- Everything below is deliberately far down the page: cropping and dropping have to
+     work after a real scroll, not only for whatever happens to be at the top. -->
+<div style="height:1200px;background:#fafafa"></div>
+<div id="red-box" role="button" aria-label="Red box" style="width:120px;height:60px;background:#ff0000"></div>
+<div id="file-zone" role="button" aria-label="File drop zone" style="width:240px;height:80px;background:#eef">Drop files here</div>
+<p id="file-out">none</p>
+<script>
+  // A drop zone that actually accepts files: without preventDefault on dragover the
+  // browser refuses the drop, which is exactly the state the tool has to explain.
+  (() => {
+    const zone = document.getElementById('file-zone');
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    });
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      const files = Array.from(event.dataTransfer.files || []);
+      window.__droppedFiles = files.map((f) => f.name + ':' + f.size);
+      window.__droppedTypes = Array.from(event.dataTransfer.types || []);
+      document.getElementById('file-out').textContent = window.__droppedFiles.join(',') || 'none';
+    });
+  })();
+</script>
 `;
 
 const SECOND_HTML = `<!doctype html>
@@ -143,6 +171,8 @@ const secondUrl = pathToFileURL(secondFile).href;
 
 const uploadFile = join(dir, 'upload-me.txt');
 writeFileSync(uploadFile, 'uploaded by the smoke test\n', 'utf8');
+const secondDropFile = join(dir, 'second-drop.txt');
+writeFileSync(secondDropFile, 'second file contents\n', 'utf8');
 
 // Frames need real HTTP: see tests/iframe-fixture.mjs for why file:// cannot do it.
 const sites = await startIframeSites();
@@ -171,9 +201,9 @@ const host = new BrowserHost({
 try {
   console.log('1) start private browser');
   const started = Date.now();
-  const conn = await host.page();
+  // `let`: switching tabs replaces the page session under us.
+  let conn = await host.page();
   ok('cdp session', `${Date.now() - started}ms`);
-
   console.log('2) navigate');
   const nav = await navigate(conn, url, { timeoutMs: 30000 });
   ok('navigate', `${nav.readyState} ${nav.url.slice(-24)}`);
@@ -559,6 +589,103 @@ try {
     recorded = settled.length;
   } catch (error) {
     fail('slow download', error.message);
+  }
+
+  console.log('25) files dragged in from disk reach the drop zone');
+  try {
+    await navigate(conn, url, { timeoutMs: 20000 });
+    await evaluate(conn, 'window.scrollTo(0, 0)');
+    const zone = await elementBox(conn, '#file-zone');
+    ok('drop zone scrolled into view', `@${Math.round(zone.x)},${Math.round(zone.y)} ${Math.round(zone.width)}x${Math.round(zone.height)}`);
+
+    await evaluate(conn, 'window.__droppedFiles = null');
+    await dragProbe(conn);
+    await dropFilesAt(conn, { x: zone.x + zone.width / 2, y: zone.y + zone.height / 2 }, [uploadFile, secondDropFile]);
+    const seen = await dragProbe(conn);
+
+    const dropped = await evaluate(conn, 'window.__droppedFiles');
+    const types = await evaluate(conn, 'window.__droppedTypes');
+    const expected = [
+      `upload-me.txt:${readFileSync(uploadFile).length}`,
+      `second-drop.txt:${readFileSync(secondDropFile).length}`,
+    ];
+    if (JSON.stringify(dropped) === JSON.stringify(expected)) ok('DataTransfer.files carried both paths', dropped.join(', '));
+    else fail('drag files', JSON.stringify({ dropped, expected }));
+    if (Array.isArray(types) && types.includes('Files')) ok('the page sees a file drag', types.join(','));
+    else fail('file drag types', JSON.stringify(types));
+    if (seen?.drop > 0) ok('drop event counted', `drop ${seen.drop}`);
+    else fail('drop event', JSON.stringify(seen));
+  } catch (error) {
+    fail('drag files', error.message);
+  }
+
+  console.log('26) a cropped screenshot is the region asked for, not a blank block');
+  try {
+    const box = await elementBox(conn, '#red-box');
+    // The clip is in document pixels. Passing the viewport coordinates straight
+    // through produced a blank white 120x60 image while this was being written —
+    // which is exactly the failure this step exists to catch, so keep the scroll.
+    const scroll = await evaluate(conn, '({ x: Math.round(scrollX), y: Math.round(scrollY) })');
+    const patch = { x: box.x + scroll.x, y: box.y + scroll.y, width: box.width, height: box.height };
+
+    const crop = readPng(await screenshotRegion(conn, patch));
+    const centre = crop.pixel(crop.width / 2, crop.height / 2);
+    if (crop.width === 120 && crop.height === 60) ok('crop is the element size', `${crop.width}x${crop.height}`);
+    else fail('crop size', `${crop.width}x${crop.height}`);
+    if (isRed(centre) && crop.coverage(isRed) > 0.9) {
+      ok('crop pixels are the element', `rgb(${centre.join(',')}), coverage ${crop.coverage(isRed).toFixed(2)}`);
+    } else {
+      fail('crop pixels', `centre rgb(${centre.join(',')}) coverage ${crop.coverage(isRed).toFixed(2)}`);
+    }
+
+    const full = readPng(await screenshot(conn));
+    if (full.width === 1280 && full.height === 800) ok('the full screenshot is still the viewport');
+    else fail('full screenshot size', `${full.width}x${full.height}`);
+
+    const doubled = readPng(await screenshotRegion(conn, { ...patch, scale: 2 }));
+    if (doubled.width === 240 && doubled.height === 120) ok('scale doubles the pixels', `${doubled.width}x${doubled.height}`);
+    else fail('scale', `${doubled.width}x${doubled.height}`);
+  } catch (error) {
+    fail('crop screenshot', error.message);
+  }
+
+  console.log('27) tabs: create, switch, close');
+  try {
+    const before = await host.listTabs();
+    const created = await host.newTab(secondUrl);
+    const afterCreate = await host.listTabs();
+    const active = afterCreate.find((tab) => tab.active);
+    if (afterCreate.length === before.length + 1 && active?.id === created.id) {
+      ok('new tab opened and became active', `${before.length} -> ${afterCreate.length}`);
+    } else {
+      fail('new tab', JSON.stringify({ before: before.length, after: afterCreate.length, active: active?.id, created }));
+    }
+
+    conn = await host.page();
+    const title = await evaluate(conn, 'document.title');
+    if (title === 'dsh bg cu smoke 2') ok('the session moved to the new tab', title);
+    else fail('tab content', JSON.stringify(title));
+
+    const oldTab = before.find((tab) => tab.url === url) ?? before[0];
+    conn = await host.useTab(oldTab.id);
+    const backTitle = await evaluate(conn, 'document.title');
+    if (backTitle === 'dsh bg cu smoke') ok('switched back to the first tab', backTitle);
+    else fail('switch back', JSON.stringify(backTitle));
+
+    const closed = await host.closeTab(created.id);
+    const afterClose = await host.listTabs();
+    if (afterClose.length === afterCreate.length - 1) ok('tab closed', `${afterClose.length} left`);
+    else fail('close tab', JSON.stringify({ closed, remaining: afterClose.length }));
+
+    // Closing the tab currently being driven must hand the session to another one
+    // instead of leaving every later call on a dead socket.
+    const handedOver = await host.closeTab(host.pageTargetId);
+    conn = await host.page();
+    const alive = await evaluate(conn, '1 + 1');
+    if (alive === 2) ok('closing the active tab hands the session over', `${handedOver.remaining} tab(s) were already open`);
+    else fail('close active tab', JSON.stringify({ alive, handedOver }));
+  } catch (error) {
+    fail('tabs', error.message);
   }
 
   console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);

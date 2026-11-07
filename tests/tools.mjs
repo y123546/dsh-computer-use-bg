@@ -16,6 +16,7 @@ import { pathToFileURL } from 'node:url';
 
 import { ATTR_BODY, startDownloadSite } from './download-fixture.mjs';
 import { startIframeSites } from './iframe-fixture.mjs';
+import { isRed, readPng } from './png.mjs';
 
 const PORT = 9474;
 
@@ -68,12 +69,38 @@ const PAGE = `<!doctype html>
     document.getElementById('later').appendChild(ready);
   }, 900);
 </script>
+<a id="pop" href="popup.html" target="_blank" aria-label="Open popup">Open popup</a>
+<!-- Below the fold on purpose: cropping and dropping happen after a scroll. -->
+<div style="height:1400px;background:#fafafa"></div>
+<div id="redbox" role="button" aria-label="Red box" style="width:120px;height:60px;margin-left:40px;background:#ff0000"></div>
+<div id="zone" role="button" aria-label="File drop zone" style="width:240px;height:80px;background:#eef">Drop files here</div>
+<p id="fv">none</p>
+<script>
+  (() => {
+    const zone = document.getElementById('zone');
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    });
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      window.__files = Array.from(event.dataTransfer.files || []).map((f) => f.name + ':' + f.size);
+      document.getElementById('fv').textContent = window.__files.join(',');
+    });
+  })();
+</script>
 `;
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-bg-tools-'));
 const pageFile = join(dir, 'page.html');
 writeFileSync(pageFile, PAGE, 'utf8');
 const pageUrl = pathToFileURL(pageFile).href;
+const popupFile = join(dir, 'popup.html');
+writeFileSync(
+  popupFile,
+  '<!doctype html><meta charset="utf-8"><title>popup page</title><h1>Popup</h1><button aria-label="Popup button">Popup button</button>',
+  'utf8',
+);
 const uploadFile = join(dir, 'note.txt');
 writeFileSync(uploadFile, 'hello upload\n', 'utf8');
 
@@ -86,6 +113,9 @@ const fail = (label, detail = '') => {
 
 // --- mock cordis ctx -------------------------------------------------------
 const registered = new Map();
+// The attachment store sees the real bytes, so the test can decode the image and
+// check the pixels a cropped screenshot claims to contain.
+const savedImages = [];
 const services = {
   logger: { info() {}, warn() {}, error() {} },
   effect: (fn) => fn(),
@@ -99,6 +129,7 @@ const services = {
   // honest to whitelist.
   attachments: {
     async saveImage({ data, mediaType, name }) {
+      savedImages.push({ data, name, mediaType });
       return { attachmentId: `sha256:${'0'.repeat(64)}`, mediaType, bytes: data.length, width: 1440, height: 900, name };
     },
   },
@@ -268,7 +299,88 @@ try {
     downloadSite.close();
   }
 
-  console.log('12) close');
+  console.log('12) a cropped screenshot really contains the element');
+  // Back to the fixture: the download step left the session on another site.
+  await call('browser_open', { url: pageUrl, screenshot: false });
+  const crop = await call('browser_screenshot', { selector: '#redbox', padding: 0 });
+  const cropBytes = savedImages.filter((image) => image.name === 'crop.png').pop();
+  if (/Captured/.test(crop.text) && /Image 120x60 px/.test(crop.text)) ok('crop reports the element size', crop.text.split('\n')[1]);
+  else fail('crop text', crop.text.replace(/\n/g, ' | '));
+  if (cropBytes?.data) {
+    const decoded = readPng(cropBytes.data);
+    const centre = decoded.pixel(decoded.width / 2, decoded.height / 2);
+    // The tool scrolls first; if the clip used the wrong coordinate space this would be
+    // a white block, which is precisely the bug the pixel check exists for.
+    if (decoded.width === 120 && decoded.height === 60 && isRed(centre)) {
+      ok('the returned bytes are the red element', `rgb(${centre.join(',')}) coverage ${decoded.coverage(isRed).toFixed(2)}`);
+    } else {
+      fail('crop pixels', `${decoded.width}x${decoded.height} rgb(${centre.join(',')})`);
+    }
+  } else {
+    fail('crop attachment', 'saveImage was never called with crop.png');
+  }
+  if (/scrolled/.test(crop.text)) ok('the scroll is disclosed, so stale coordinates are expected');
+  else fail('scroll disclosure', crop.text.replace(/\n/g, ' | '));
+
+  const padded = await call('browser_screenshot', { selector: '#redbox', padding: 10, scale: 2 });
+  if (/Image 280x160 px \(scale 2\)/.test(padded.text)) ok('padding and scale applied', '280x160');
+  else fail('padding/scale', padded.text.replace(/\n/g, ' | '));
+
+  console.log('13) files dropped from disk land in the drop zone');
+  const dropFile = join(dir, 'drop-me.txt');
+  writeFileSync(dropFile, 'dragged in\n', 'utf8');
+  const dropped = await call('browser_drop_files', { text: 'File drop zone', files: [dropFile], screenshot: false });
+  if (/The drop landed/.test(dropped.text)) ok('drop reported as landed', dropped.text.split('\n')[1]);
+  else fail('drop verdict', dropped.text.split('\n').slice(0, 3).join(' | '));
+  const seenByPage = await call('browser_eval', { expression: 'window.__files || null' });
+  if (seenByPage.text.includes('drop-me.txt:11')) ok('the page received the real file', seenByPage.text.replace(/\s+/g, ' '));
+  else fail('files at the page', seenByPage.text);
+
+  const gone = await call('browser_drop_files', { text: 'File drop zone', files: [join(dir, 'not-here.txt')] }).then(() => null).catch((error) => error.message);
+  if (gone && gone.includes('do not exist')) ok('a missing file is refused before any gesture');
+  else fail('missing drop file', String(gone));
+
+  console.log('14) a target=_blank click opens a tab, and the session follows it');
+  await call('browser_eval', { expression: 'window.scrollTo(0, 0)' });
+  const popClick = await call('browser_click', { text: 'Open popup', screenshot: false });
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  const tabList = await call('browser_tabs', { action: 'list' });
+  if (/new tab opened/.test(popClick.text)) ok('the click result says a tab opened', popClick.text.split('\n').pop().slice(0, 80));
+  else fail('new tab note', popClick.text.split('\n').slice(-2).join(' | '));
+
+  const popupLine = tabList.text.split('\n').find((line) => line.includes('popup.html'));
+  if (popupLine) ok('the popup is its own tab', popupLine.trim().slice(0, 70));
+  else fail('popup in list', tabList.text.replace(/\n/g, ' | ').slice(0, 300));
+
+  // The list prints "id  title" then an indented URL line, so the URL has to be
+  // attached to the entry above it rather than parsed on its own.
+  const tabEntries = [];
+  for (const line of tabList.text.split('\n')) {
+    const head = line.match(/^(\*?)\s+([0-9a-f]{8,})\s{2,}(.*)$/i);
+    if (head) tabEntries.push({ active: head[1] === '*', id: head[2], title: head[3], url: '' });
+    else if (tabEntries.length > 0 && /^\s{4}\S/.test(line)) tabEntries[tabEntries.length - 1].url = line.trim();
+  }
+  const popupTab = tabEntries.find((entry) => entry.url.includes('popup.html'));
+  if (popupTab) {
+    if (popupTab.active) ok('the popup is the active tab, as the note said');
+    else fail('popup active', JSON.stringify(tabEntries));
+
+    const selected = await call('browser_tabs', { action: 'select', id: popupTab.id, screenshot: false });
+    if (/Switched to tab/.test(selected.text) && /popup page/.test(selected.text)) ok('select switches to it', 'popup page');
+    else fail('select tab', selected.text.split('\n').slice(0, 3).join(' | '));
+
+    const closedPopup = await call('browser_tabs', { action: 'close', id: popupTab.id, screenshot: false });
+    if (/Closed tab/.test(closedPopup.text)) ok('the popup can be closed again', closedPopup.text.split('\n')[0]);
+    else fail('close popup', closedPopup.text.split('\n')[0]);
+    // Closing the tab that was being driven must leave a working session behind.
+    const stillAlive = await call('browser_eval', { expression: '1 + 1' });
+    if (stillAlive.text.trim() === '2') ok('the session survived closing its own tab');
+    else fail('session after close', stillAlive.text);
+  } else {
+    fail('popup entry', JSON.stringify(tabEntries));
+  }
+
+  console.log('15) close');
   const closed = await call('browser_close');
   if (closed.text.includes('shut down')) ok('close');
   else fail('close', closed.text.slice(0, 120));
