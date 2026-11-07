@@ -156,6 +156,15 @@ tests/         端到端验证
 5. **端口会被别的 Chromium 抢走，而它一样能应答。** DSH 自己就带 `--remote-debugging-port`（本机 `StartDSH.bat` 里是 9333）。旧版本只在启动前探一下端口：有东西应答就直接连上去，等于连到 **DSH 自己的 DevTools**，`browser_open` 会去导航应用窗口。现在改成：端口被占就往后找空端口，自己起浏览器，再用 `Browser.getBrowserCommandLine` 核对 `--user-data-dir` 是不是我们的 profile —— 认不上就杀掉重来，绝不碰别人的端点。端口默认值也因此从 9333 改成 **9411**。
 6. **全新 profile 的 target 会假握手。** 新建的 profile 首次启动时，渲染进程还在初始化，target 能连上却一条命令都不回。连上后必须做健康检查，失败就换新 target 重试（最多 4 次，每次间隔 700ms）。
 7. **别用浏览器级 socket + `Target.attachToTarget` 走会话。** 在这台 Edge 155 上，attach 之后渲染器直接 `Inspector.targetCrashed`，有头无头都一样。页面级 target 才稳。
+8. **每个 tool 必须声明 `output: { schema, render }`，否则整个插件装不上。** 这是最贵的一条坑：DSH 的 `ToolService.register` 会直接抛错，插件在「插件」页显示红色「异常」，但**没有任何地方告诉你原因** —— 详情页只渲染 README。真实报错要这么挖：页面是 React 渲染的，沿插件行的 `__reactFiber$` 往上层找 `memoizedProps.pkg`，里面的 `rows[0].diagnostic` 才是原文：
+   ```
+   tool "computer_use_doctor" must declare output { schema, render, presentationMeta? }
+   ```
+   判定逻辑在 `@deepseek-ai/dsh-client-ui-plugin-manager/lib/client.js`：
+   ```js
+   if (pkg.error !== undefined || pkg.enabled && pkg.rows.some(r => r.phase === "failed")) return "problem";
+   ```
+   `render(args, value)` 返回 content block 数组，截图要给 `{ type: 'image', attachment: ref }`；`output.schema` 是 `additionalProperties: false`，所以 attachment ref 必须白名单裁剪，多一个字段都会校验失败。`tests/load.mjs` 现在原样复刻了这套校验，本地就能拦住。
 
 ## License
 
