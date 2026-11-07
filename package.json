@@ -12,6 +12,7 @@
   },
   "files": [
     "lib/*.js",
+    "helpers/*",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
