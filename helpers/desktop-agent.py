@@ -38,6 +38,8 @@ import time
 import zlib
 from ctypes import wintypes
 
+import pixels
+
 IS_WINDOWS = sys.platform.startswith('win')
 
 # --- Win32 bindings --------------------------------------------------------
@@ -168,6 +170,8 @@ def _bind():
     u.GetWindowThreadProcessId.restype = wintypes.DWORD
     u.GetWindow.argtypes = [HWND, wintypes.UINT]
     u.GetWindow.restype = HWND
+    u.GetAncestor.argtypes = [HWND, wintypes.UINT]
+    u.GetAncestor.restype = HWND
     u.PostMessageW.argtypes = [HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     u.SendMessageTimeoutW.restype = LRESULT
     u.SendMessageTimeoutW.argtypes = [
@@ -467,88 +471,164 @@ def read_text(target):
 
 # --- screenshot ------------------------------------------------------------
 
-def write_png(path, width, height, rows):
-    raw = b''.join(b'\x00' + row for row in rows)
-    compressed = zlib.compress(raw, 6)
-
-    def chunk(tag, data):
-        return (struct.pack('>I', len(data)) + tag + data +
-                struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-    png = b'\x89PNG\r\n\x1a\n'
-    png += chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
-    png += chunk(b'IDAT', compressed)
-    png += chunk(b'IEND', b'')
-    with open(path, 'wb') as handle:
-        handle.write(png)
-
-
-def capture(hwnd, path, client_only=True):
+def capture(hwnd, path, client_only=True, grid=False):
     """
-    Draw a window into a bitmap without showing it.
+    Draw a window into a bitmap without showing it, optionally with a ruler on top.
 
-    PrintWindow asks the app to paint into a DC we own, so it works for a window that
-    is covered, off screen, or on an invisible desktop. A minimised window has nothing
+    PrintWindow asks the app to paint into a DC we own, so it works for a window that is
+    covered, off screen, or on an invisible desktop. A minimised window has nothing
     painted, and a few GPU-composited apps hand back an empty frame; both are reported
     as such instead of shipping a blank image.
     """
-    width = height = 0
-    flags = PW_RENDERFULLCONTENT
-    if client_only:
-        size = client_rect_of(hwnd)
-        width, height = size['width'], size['height']
-        flags |= PW_CLIENTONLY
-    if width <= 0 or height <= 0:
-        rect = rect_of(hwnd)
-        width, height = rect['width'], rect['height']
-        flags = PW_RENDERFULLCONTENT
-        client_only = False
-    if width <= 0 or height <= 0:
-        raise RuntimeError('that window has no drawable area (%dx%d)' % (width, height))
-    if user32.IsIconic(hwnd):
-        raise RuntimeError('that window is minimised, so there is nothing painted to capture — restore it first')
+    shot = pixels.grab(hwnd, client_only)
+    rgb = shot['rgb']
+    if grid:
+        # The ruler exists for the case with no accessibility tree: estimating a pixel
+        # from a bare rectangle is guesswork, estimating it off tick marks is not.
+        rgb = pixels.draw_grid(shot['width'], shot['height'], rgb)
+    pixels.write_png(path, shot['width'], shot['height'], rgb)
+    return {
+        'path': path,
+        'width': shot['width'],
+        'height': shot['height'],
+        'clientOnly': shot['clientOnly'],
+        'painted': shot['painted'],
+        'grid': bool(grid),
+        'clientOrigin': client_origin(hwnd),
+    }
 
-    window_dc = user32.GetWindowDC(hwnd)
-    mem_dc = gdi32.CreateCompatibleDC(window_dc)
-    info = BITMAPINFO()
-    info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    info.bmiHeader.biWidth = width
-    info.bmiHeader.biHeight = -height  # top-down: no row flipping afterwards
-    info.bmiHeader.biPlanes = 1
-    info.bmiHeader.biBitCount = 32
-    info.bmiHeader.biCompression = 0
-    bits = ctypes.c_void_p()
-    bitmap = gdi32.CreateDIBSection(mem_dc, ctypes.byref(info), DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
-    if not bitmap:
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(hwnd, window_dc)
-        raise RuntimeError('could not allocate a %dx%d bitmap' % (width, height))
-    old = gdi32.SelectObject(mem_dc, bitmap)
+
+GA_ROOT = 2
+
+
+def top_level(hwnd):
+    """The top-level window that owns a control — the thing worth diffing."""
+    if not hwnd:
+        return None
+    root = user32.GetAncestor(hwnd, GA_ROOT)
+    return root or hwnd
+
+
+def describe_change(anchor, before, windows_before):
+    """
+    What actually changed on screen.
+
+    Two signals, because one is not enough: the window's own pixels (did it repaint?) and
+    the set of visible windows (did a dialog appear?). A click that opens a modal changes
+    the window list while the parent's pixels stay put; a click that only moves a caret
+    changes pixels and adds no window. Reporting both, with how much and where, lets the
+    caller decide instead of trusting a bare "done".
+    """
+    out = {}
+    # A posted click and a UI change are not the same instant: the dialog is destroyed a
+    # frame or two after the button's mouse-up. Grabbing immediately catches the button
+    # still pressed and reports pixels instead of "it closed".
+    time.sleep(0.15)
+    if anchor and not user32.IsWindow(anchor):
+        # It closed: that is a change, and a very definite one.
+        out['closed'] = True
+        anchor = None
+        before = None
+    if anchor and before is not None:
+        try:
+            after = pixels.grab(anchor, True)
+        except Exception as error:  # noqa: BLE001 - verification must never fail an action
+            out['error'] = str(error)
+        else:
+            out.update(pixels.diff(before, after))
+    if windows_before is not None:
+        appeared = [hwnd for hwnd in visible_windows() if hwnd not in windows_before]
+        out['newWindows'] = [
+            {'id': win_id(hwnd), 'title': text_of(hwnd)[:60], 'class': class_of(hwnd)} for hwnd in appeared[:4]
+        ]
+    return out
+
+
+def act_anchor(payload):
+    """Which window to watch: the target control's top-level, or the named window."""
+    raw = str(payload.get('target') or '')
+    if raw.startswith('u'):
+        api = get_uia()
+        if api:
+            try:
+                info = api.describe(api.element_for(raw))
+                if info['nativeWindowHandle']:
+                    return info['nativeWindowHandle']
+            except Exception:  # noqa: BLE001
+                pass
+        raw = ''
     try:
-        painted = user32.PrintWindow(hwnd, mem_dc, flags)
-        stride = width * 4
-        raw = ctypes.string_at(bits, stride * height)
-        rows = []
-        for y in range(height):
-            line = bytearray(raw[y * stride:(y + 1) * stride])
-            # BGRA -> RGB: swap the red and blue bytes in place, then drop alpha.
-            line[0::4], line[2::4] = line[2::4], line[0::4]
-            del line[3::4]
-            rows.append(bytes(line))
-        write_png(path, width, height, rows)
-        return {
-            'path': path,
-            'width': width,
-            'height': height,
-            'clientOnly': client_only,
-            'painted': bool(painted),
-            'clientOrigin': client_origin(hwnd),
-        }
-    finally:
-        gdi32.SelectObject(mem_dc, old)
-        gdi32.DeleteObject(bitmap)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(hwnd, window_dc)
+        return parse_id(raw) if raw else (parse_id(payload.get('window')) if payload.get('window') else None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _act_body(payload, isolated):
+    """The action itself, with no verification around it."""
+    action = str(payload.get('action') or 'click').lower()
+    raw_target = str(payload.get('target') or '')
+    if raw_target.startswith('u'):
+        return act_on_uia_element(action, raw_target, payload, isolated)
+    target = parse_id(payload.get('target')) if payload.get('target') else None
+    window = parse_id(payload.get('window')) if payload.get('window') else None
+    subject = target or window
+    if not subject or not user32.IsWindow(subject):
+        raise RuntimeError('need a live target (or window) from a previous call')
+    if action == 'click':
+        if target and payload.get('x') is None:
+            return click_center(target)
+        origin = payload.get('origin') or 'client'
+        if origin == 'screen':
+            point = wintypes.POINT(int(payload.get('x', 0)), int(payload.get('y', 0)))
+            user32.ScreenToClient(subject, ctypes.byref(point))
+            return click_at(subject, point.x, point.y, payload.get('button', 'left'), int(payload.get('count', 1)))
+        return click_at(subject, int(payload.get('x', 0)), int(payload.get('y', 0)),
+                        payload.get('button', 'left'), int(payload.get('count', 1)))
+    if action == 'type':
+        if target is None:
+            raise RuntimeError('type needs a target control — pick one from the tree')
+        return type_text(target, payload.get('text'))
+    if action == 'key':
+        return press_keys(subject, payload.get('keys'))
+    if action == 'scroll':
+        return scroll(subject, int(payload.get('x', 10)), int(payload.get('y', 10)), int(payload.get('delta', -120)))
+    if action == 'focus':
+        user32.SetForegroundWindow(subject)
+        return {'focused': True, 'note': 'this does bring the window forward'}
+    if action == 'close':
+        post(subject, WM_CLOSE)
+        return {'closed': True}
+    raise RuntimeError('unknown action "%s"' % action)
+
+
+def handle_act(payload, isolated):
+    """
+    Run one action, then say what changed.
+
+    The verification is deliberately outside the action: a screenshot that fails must
+    never turn a successful click into an error, and read/focus cannot change pixels.
+    """
+    action = str(payload.get('action') or 'click').lower()
+    want_verify = action in ('click', 'type') and payload.get('verify') is not False
+
+    anchor = None
+    before = None
+    windows_before = None
+    if want_verify:
+        try:
+            anchor = top_level(act_anchor(payload))
+            before = pixels.grab(anchor, True) if anchor else None
+        except Exception:  # noqa: BLE001
+            before = None
+        try:
+            windows_before = set(visible_windows())
+        except Exception:  # noqa: BLE001
+            windows_before = None
+
+    result = _act_body(payload, isolated)
+    if want_verify and isinstance(result, dict):
+        result['verify'] = describe_change(anchor, before, windows_before)
+    return result
 
 
 # --- input -----------------------------------------------------------------
@@ -906,42 +986,9 @@ def handle(payload, isolated=None):
         return {'text': read_text(hwnd)[:4000]}
     if cmd == 'shot':
         hwnd = parse_id(payload.get('window'))
-        return capture(hwnd, payload['path'], payload.get('clientOnly', True))
+        return capture(hwnd, payload['path'], payload.get('clientOnly', True), bool(payload.get('grid')))
     if cmd == 'act':
-        action = str(payload.get('action') or 'click').lower()
-        raw_target = str(payload.get('target') or '')
-        if raw_target.startswith('u'):
-            return act_on_uia_element(action, raw_target, payload, isolated)
-        target = parse_id(payload.get('target')) if payload.get('target') else None
-        window = parse_id(payload.get('window')) if payload.get('window') else None
-        subject = target or window
-        if not subject or not user32.IsWindow(subject):
-            raise RuntimeError('need a live target (or window) from a previous call')
-        if action == 'click':
-            if target and payload.get('x') is None:
-                return click_center(target)
-            origin = payload.get('origin') or 'client'
-            if origin == 'screen':
-                point = wintypes.POINT(int(payload.get('x', 0)), int(payload.get('y', 0)))
-                user32.ScreenToClient(subject, ctypes.byref(point))
-                return click_at(subject, point.x, point.y, payload.get('button', 'left'), int(payload.get('count', 1)))
-            return click_at(subject, int(payload.get('x', 0)), int(payload.get('y', 0)),
-                            payload.get('button', 'left'), int(payload.get('count', 1)))
-        if action == 'type':
-            if target is None:
-                raise RuntimeError('type needs a target control — pick one from the tree')
-            return type_text(target, payload.get('text'))
-        if action == 'key':
-            return press_keys(subject, payload.get('keys'))
-        if action == 'scroll':
-            return scroll(subject, int(payload.get('x', 10)), int(payload.get('y', 10)), int(payload.get('delta', -120)))
-        if action == 'focus':
-            user32.SetForegroundWindow(subject)
-            return {'focused': True, 'note': 'this does bring the window forward'}
-        if action == 'close':
-            post(subject, WM_CLOSE)
-            return {'closed': True}
-        raise RuntimeError('unknown action "%s"' % action)
+        return handle_act(payload, isolated)
     if cmd == 'launch':
         path = str(payload.get('path') or '').strip()
         if not path:

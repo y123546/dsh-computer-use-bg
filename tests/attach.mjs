@@ -114,7 +114,24 @@ try {
     else fail('click', JSON.stringify(state));
   }
 
-  console.log('4) letting go does not close somebody else\'s browser');
+  console.log("4) accessibility can be switched on over this session");
+  // This is the switch that turns an opaque Electron window into something UI
+  // Automation can read, so it has to be reachable through the same session.
+  const enabled = await conn.send('Accessibility.enable', {}, { timeoutMs: 10000 }).then(() => true).catch(() => false);
+  if (enabled) ok('Accessibility.enable accepted');
+  else fail('Accessibility.enable', 'the app refused it');
+
+  const ax = await conn.send('Accessibility.getFullAXTree', {}, { timeoutMs: 20000 }).catch(() => null);
+  const names = Array.isArray(ax?.nodes) ? ax.nodes.map((node) => node?.name?.value || '').filter(Boolean) : [];
+  // The button was clicked in step 3, so its name is "pressed" by now — match either.
+  const flat = names.join(' | ');
+  if (Array.isArray(ax?.nodes) && /pressed|Press me/.test(flat) && /Field/.test(flat)) {
+    ok('the tree has the page content in it', `${ax.nodes.length} nodes, button and field both named`);
+  } else {
+    fail('accessibility tree', `${ax?.nodes?.length ?? 'no'} nodes, names: ${flat.slice(0, 120)}`);
+  }
+
+  console.log("5) letting go does not close somebody else's browser");
   await host.shutdown();
   await sleep(400);
   const alive = await fetch(`http://127.0.0.1:${PORT}/json/version`).then((r) => r.ok).catch(() => false);
@@ -125,7 +142,7 @@ try {
   if (stillThere.includes(String(child.pid))) ok('its process is still alive', `pid ${child.pid}`);
   else fail('process gone', `pid ${child.pid}`);
 
-  console.log('5) detach goes back to owning a private browser');
+  console.log('6) detach goes back to owning a private browser');
   const detached = await host.detach();
   if (detached.detached && host.foreign === false) ok('detached', `was ${detached.was}`);
   else fail('detach', JSON.stringify(detached));

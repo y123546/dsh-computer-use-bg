@@ -1,6 +1,6 @@
 {
   "name": "dsh-computer-use-bg",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Background computer use for DeepSeek Harness: drive a private Chromium over CDP with no window, no stolen mouse, no stolen keyboard.",
   "type": "module",
   "main": "lib/index.js",
@@ -55,7 +55,10 @@
     "devtools-protocol",
     "ui-automation",
     "accessibility",
-    "semantic-tree"
+    "semantic-tree",
+    "ocr",
+    "coordinate-grid",
+    "pixel-diff"
   ],
   "license": "MIT"
 }

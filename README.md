@@ -89,12 +89,12 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_hover` | 悬停后告诉模型**新出现了什么**（下拉菜单、tooltip），并给这些新元素的 `ref`，接着就能点 |
 | `browser_drag` | 拖拽：滑块、可排序列表、看板、拖放上传。结果会说明页面用的是 pointer 事件还是原生 HTML5 拖拽 |
 | `browser_screenshot` | 只截一个元素或一块区域。比整屏省一个量级的图片 token，看小字还可以 `scale: 2` |
-| `browser_attach` | 接管**已经在运行**的应用（DSH 自己、Chrome、VS Code…）：用它的 DevTools 端口，不需要 token |
+| `browser_attach` | 接管**已经在运行**的应用（DSH 自己、Chrome、VS Code…）：用它的 DevTools 端口，不需要 token；`accessibility: true` 还能让它发布原生无障碍树 |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用）；接管模式下调它只是松手，不会关掉那个应用 |
 | `desktop_windows` | 列出**原生窗口**：自己的桌面 + 本插件开的隔离桌面，带进程、pid、尺寸 |
 | `desktop_tree` | 读一个原生窗口的**语义控件树**（UI Automation）：角色、名字、`u1` 这样的 ref；读不到再退回 Win32 子窗口 |
 | `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。`u…` ref 走控件自己的模式（Invoke / Value），不移动鼠标、不抢焦点 |
-| `desktop_shot` | 截一个原生窗口（客户区），窗口被遮住、最小化以外的情形都能画出来 |
+| `desktop_shot` | 截一个原生窗口（客户区），窗口被遮住也能画出来；`grid: true` 会在图上叠一把像素标尺 |
 | `desktop_launch` | 启动一个本机程序，默认放进**隔离桌面**：正常运行，但窗口不出现在你屏幕上 |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
@@ -203,7 +203,45 @@ UI Automation     21 个   （文本编辑器 / 状态栏 / 垂直滚动条 / �
 - **输入** → `Value.SetValue`；没有值模式的老控件（记事本的编辑框就是）改用它的窗口消息写。
 - **读** → `Value` → `Text` → 窗口消息，三级降级。三级都不行时只说"只有名字可用"，**不会把名字当成内容返回**。
 
-纯 canvas 自绘、或者没开无障碍的 Electron，两边都是空壳：那时用 `desktop_shot` 看图 + 坐标点击；如果它是 Chromium/Electron，**优先 `browser_attach`**，那是 DOM 级别的精确。
+### 没有任何控件树的时候（游戏、canvas、远程桌面）
+
+这类窗口里连一个语义节点都没有，唯一能做的就是 **看 → 估坐标 → 点 → 再看**。这条路能不能用，取决于两件工程上的事，插件的三个功能就是为它们存在的：
+
+**1. 坐标不能有歧义。** `desktop_shot` 截的是**客户区**，`desktop_act` 的 `x`/`y` 就是这张图上的像素——同一个坐标系，1:1，不存在缩放换算（这是视觉方案最常见的静默失败：Retina 截图是物理像素、点击是逻辑点，差一个固定倍率）。要估坐标就加 `grid: true`，图上会叠一把标尺：
+
+```text
+desktop_shot { "window": "w004e0592", "grid": true }
+→ 图上每 100px 一条线，每 200px 一个刻度数字
+desktop_act  { "window": "w004e0592", "x": 412, "y": 96 }
+```
+
+**2. 点完要能验证。** 没有控件树可读时，"我点了" 和 "发生了什么" 是两句话。所以 `desktop_act` 的 `click` / `type` 会**自动做一次前后对比**（`verify: false` 可关）：
+
+- 窗口重绘了多少、重绘发生在哪块区域；
+- 有没有**新窗口**冒出来（点了按钮弹出对话框，父窗口的像素可以一点没变）；
+- 窗口是不是**已经关掉**了；
+- 或者——**屏幕上什么都没变**。这句是这套方案里最有价值的一句：它把"点了没反应"从猜测变成了观测。
+
+```text
+Screen check: nothing changed — the action was delivered, but the window did not repaint
+and no new window appeared. The click probably missed; look at desktop_shot before trying again.
+```
+
+### Electron / Chromium：空壳是可以打开的
+
+Chromium 的 Web 无障碍树是**惰性构建**的——只有检测到辅助技术来查询才建。所以一个正在跑的 Electron 应用，在 UIA 眼里往往只有一个空 pane，这就是"整窗自绘、读不到"的真正原因，而不是它不支持无障碍。
+
+`browser_attach { accessibility: true }` 会通过 CDP 把 `Accessibility.enable` 打开，让那个应用**当场把原生树建起来**。实测（同一个 Chromium 窗口，用本插件的 UIA 读）：
+
+```text
+开关前   26 个控件 —— 标题栏 / 工具栏 / 地址栏 / 标签页，页面内容一个都没有
+开关后   29 个，多出来的正是页面：
+         document / a11y probe
+         button   / Pay now
+         text field / Card number
+```
+
+意义在于：打开之后，**任何**读 UIA 的工具（本插件的 `desktop_tree`、屏读软件、别的自动化框架）都能看见它，而不只是持有 CDP 会话的那一方。开关会一直有效到那个应用重启。
 
 **为什么是 Python**：UIA 那条路（.NET `UIAutomationClient`）控件树更丰富，但开发环境里 `Add-Type` 一类调用被沙箱拦死，**一条命令都验证不了**。与其交付一堆没跑过的自动化代码，不如用一条每条断言都实跑过的路。
 
@@ -242,6 +280,14 @@ live（真实网站）
   用户自己开的 10 个 Edge 进程  完好未受影响
   结论                          屏幕上零新增窗口
 
+Chromium 的无障碍树（同一个窗口，本插件的 UIA 读）
+  Accessibility 关闭     26 个控件：标题栏 / 工具栏 / 地址栏 / 标签页，页面内容 0
+  Accessibility.enable   29 个：多出 document + button "Pay now" + text field "Card number"
+
+桌面平面的动作验证（隔离桌面里的记事本 / winver）
+  type                    changed: 重绘 0.05%，区域 (3,6) 91x13（正是第一行文字）
+  click 对话框「确定」      closed: true（窗口已消失）
+
 空闲回收（idleMs = 2500ms）
   用完当下                    子进程存活
   4 秒后                      进程已退出，host.child = null
@@ -264,9 +310,11 @@ live（真实网站）
 - **大到超出 `browser_download` 默认 30 秒预算的文件**不会等完 —— 它会如实说「still downloading」，稍后再查即可，文件继续在后台传。
 - **浏览器自己的界面页不算标签页。** `edge://`、`chrome://` 这类地址不列在 `browser_tabs` 里、也不会被自动跟随：那是浏览器 UI，不是网页，驱动它没有意义。它们照样占着一个真实标签页，所以「标签页数量」可能比你看到的多。
 - **桌面平面需要 Python 3（只用标准库）。** 找不到时它会明确报"不可用"，浏览器侧照常工作。`desktop: false` 可以彻底关掉。
-- **UI Automation 能读的地方有语义树，读不到退回 Win32。** WPF / WinForms / 老 Win32 都在前者；纯 canvas 自绘、没开无障碍的 Electron 两边都空，只能截图 + 坐标（Chromium 系用 `browser_attach` 更准）。
+- **UI Automation 能读的地方有语义树，读不到退回 Win32。** WPF / WinForms / 老 Win32 都在前者；纯 canvas 自绘两边都空，只能走上面的标尺 + 验证闭环。**Electron 的空壳是可以打开的**：`browser_attach { accessibility: true }`。
 - **UIA 的 ref 只对最近一次 `desktop_tree` 有效。** UI 变了就重新读：旧 `u…` 会明确报 `no element "u7" in the last snapshot`，不会静默点错地方。
 - **少数控件两种文本模式都没有**（既无 `Value` 也无 `Text`，窗口也不吐文字）。这时 `read` 会明说"只有名字"，不会假装读到了内容。
+- **设备像素比不是 1 的屏幕上，视觉坐标会有偏差。** 插件的截图和坐标都在同一坐标系里（客户区 CSS 像素），所以内部一致；但如果 Windows 显示缩放是 150%，你用肉眼看屏幕量出来的数字不能直接当 `x`/`y`——以 `desktop_shot` 返回的图为准。
+- **验证是启发式的**：闪烁的光标、动画、时钟会让"变了"误报为真。它给的是"变了/没变 + 变了哪里"，判断仍归调用方。
 - **posted 消息不是真实输入。** 少数应用只认 `SendInput`（真实输入），会忽略 `PostMessage`。这条路**故意不默认走**：真实输入必然要抢前台，那就不是"后台"了。
 - **最小化的窗口截不到内容**（没有东西被绘制），会直接报错而不是给黑图。`desktop_launch` 启动的程序默认不最小化。
 - **隔离桌面里的程序你用肉眼看不到。** 这是它的用途，但也意味着出了问题只能靠 `desktop_windows` / `desktop_tree` / `desktop_shot` 观察。想看着它跑，`isolated: false`。
@@ -287,7 +335,10 @@ live（真实网站）
 - [x] **跨域 iframe**：不同源同站走 `Page.createIsolatedWorld`，跨站（独立进程）走 `Target.attachToTarget` + `sessionId`，快照 / 文字 / 等待 / 点击 / 输入 / 上传全部打通
 - [x] **桌面平面（v1）**：`desktop_windows` / `desktop_tree` / `desktop_act` / `desktop_shot` / `desktop_launch`；隔离桌面（`CreateDesktopW` + 桌内 worker）里枚举、绘制、发消息，不抢前台
 - [x] **桌面平面 v2（UI Automation）**：语义树 + 通过控件模式操作。走**裸 COM**（`IUIAutomation` 的 vtable），不依赖 .NET 也不依赖 `comtypes`——这样在这个环境里能逐条验证，而不是交付一段没跑过的代码
+- [x] **无控件树时的闭环**：像素标尺（`grid`）+ 动作前后对比（重绘区域 / 新窗口 / 已关闭 / 什么都没变）
+- [x] **让 Chromium 应用发布原生无障碍树**（CDP `Accessibility.enable`）：Electron 的"空壳"从此可读，且对任何 UIA 工具生效
 - [ ] 桌面平面的**真实输入**可选模式（`SendInput` + 主动抢前台），给那些忽略 posted 消息的应用
+- [ ] 本地 OCR（Windows 自带 `Windows.Media.Ocr`）把"看图估坐标"升级成"按文字找控件"——需要 WinRT 绑定，成本较高
 - [x] **`browser_attach`**：接管已经在运行的 Chromium/Electron（DSH 自己的界面就是这样被驱动的），不新建标签页、不改尺寸、不关进程
 - [ ] 跨域 iframe 里的 `browser_eval`（现在只在主文档执行）
 
@@ -405,3 +456,8 @@ UIA 的常规入口是 .NET（`System.Windows.Automation`）或 `comtypes`。两
 
 坑集中在三处：BSTR 要 `SysFreeString`、遍历器返回的每个元素要 `Release`、COM 必须在自己线程
 `CoInitializeEx`（worker 模式下是另一个进程，各初始化一次）。
+
+32. **动作验证要等一小会儿再截"之后"的图。** posted 的点击和界面变化不是同一瞬间：对话框在鼠标抬起后一两个帧才销毁，立刻截图会拍到"按钮还按着"的像素，于是报告"变了"而不是"已关闭"。加 150ms 就没这个问题。
+33. **像素标尺的字号不能省。** 3x5 点阵字体按 scale=2 画出来，在 1440px 宽的图里缩略一看全糊成小方块——等于没画。scale=4 才真正能读。
+34. **`desktop_act` 的分支要整段提成函数再包验证。** 原来每个 action 都直接 `return`，想在外面套一层"前后对比"就必须先把它变成 `_act_body(payload)`；顺手也让这段代码从 100 行的 if 链变成一个能单独读的函数。
+35. **别在下拉菜单里找"自动打开无障碍"。** `Accessibility.enable` 是**有副作用**的（那个应用的渲染器会开始维护无障碍树，多花一点 CPU/内存），所以它是 `browser_attach` 的一个显式参数，不是默认行为。给别人应用悄悄开开关，不是插件该做的决定。
