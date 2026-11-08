@@ -441,7 +441,7 @@ try {
     else fail('desktop_windows', list.text.split('\n').slice(0, 6).join(' | '));
 
     const tree = await call('desktop_tree', { window: windowId, desktop: desktopName });
-    const control = (tree.text.match(/^\s+(c[0-9a-f]+) text field/m) || [])[1];
+    const control = (tree.text.match(/^\s+(u\d+|c[0-9a-f]+) text field/m) || [])[1];
     if (control) ok('desktop_tree found the text field', control);
     else fail('desktop_tree', tree.text.split('\n').slice(0, 6).join(' | '));
 

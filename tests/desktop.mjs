@@ -61,8 +61,24 @@ try {
   console.log('3) the control tree finds the editor');
   const tree = notepad ? await host.tree({ window: notepad.id, desktop: launched.desktop }) : null;
   const editor = tree?.controls?.find((c) => c.kind === 'text field');
-  if (editor) ok('text field found', `${editor.class} ${editor.rect.width}x${editor.rect.height} control ${editor.controlId}`);
-  else fail('control tree', JSON.stringify(tree?.controls?.map((c) => c.class)));
+  if (editor) ok('text field found', `${editor.kind} ${editor.rect.width}x${editor.rect.height} ref ${editor.id}`);
+  else fail('control tree', JSON.stringify(tree?.controls?.map((c) => c.kind)));
+
+  // The semantic tree is the point of this step: the same window exposes far more than
+  // the child windows do, and every element gets a ref (u1, u2 …).
+  if (tree?.engine === 'uia' && tree.controls.length > 5) {
+    ok('tree came from UI Automation', `${tree.controls.length} elements, refs ${tree.controls[0].id}…`);
+  } else {
+    fail('semantic tree', `engine ${tree?.engine}, ${tree?.controls?.length} elements, note ${tree?.uiaNote}`);
+  }
+  const kinds = [...new Set((tree?.controls || []).map((c) => c.kind))];
+  if (kinds.includes('status bar') || kinds.includes('menu bar')) ok('roles are real, not guessed from class names', kinds.slice(0, 6).join(', '));
+  else fail('roles', kinds.join(', '));
+
+  // The Win32 tree must still be one word away — some apps behave better there.
+  const fallback = await host.tree({ window: notepad.id, desktop: launched.desktop, engine: 'win32' });
+  if (fallback.engine === 'win32' && fallback.controls.length > 0) ok('Win32 tree still available on demand', `${fallback.controls.length} child window(s)`);
+  else fail('win32 fallback', JSON.stringify({ engine: fallback.engine, count: fallback.controls?.length }));
 
   console.log('4) typing reaches it, and it reads back');
   if (!editor) fail('skip typing', 'no editor');
@@ -105,6 +121,8 @@ try {
         fail('dialog button', JSON.stringify(dialogTree.controls.map((c) => `${c.class}:${c.text}`)));
       } else {
         const clicked = await host.act({ action: 'click', target: button.id }, { desktop: second.desktop });
+      if (clicked?.via && String(clicked.via).startsWith('UIA')) ok("click went through the element's own pattern", clicked.via);
+      else fail('uia invoke', JSON.stringify(clicked));
         // A standard button acts on the posted button-up, so the dialog should close.
         let gone = false;
         for (let i = 0; i < 20 && !gone; i += 1) {
@@ -112,7 +130,7 @@ try {
           const list = await host.windows({ desktop: second.desktop });
           gone = !list.windows.some((w) => w.id === verifier.id);
         }
-        if (gone) ok('the posted click was accepted', `${JSON.stringify(clicked)} closed "${button.text || button.class}"`);
+        if (gone) ok('the dialog window is gone afterwards', `${JSON.stringify(clicked)} closed "${button.text || button.kind}"`);
         else fail('click on a real button', `the dialog is still open after ${JSON.stringify(clicked)}`);
       }
     }

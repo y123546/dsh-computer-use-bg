@@ -715,14 +715,163 @@ def start_isolated(name, script_path):
     return Isolated(name, int(info.dwProcessId), conn)
 
 
+# --- UI Automation ---------------------------------------------------------
+
+_UIA = None
+_UIA_TRIED = False
+_UIA_ERROR = ['']
+
+
+def get_uia():
+    """
+    Lazily build one IUIAutomation for this process (and this COM apartment).
+
+    Lazy on purpose: an app that only needs window enumeration must not pay for COM
+    initialisation, and a machine where UIA refuses must degrade to the Win32 tree
+    instead of failing the whole command.
+    """
+    global _UIA, _UIA_TRIED
+    if _UIA_TRIED:
+        return _UIA
+    _UIA_TRIED = True
+    try:
+        from uia import Uia
+
+        instance = Uia()
+        if instance.ok:
+            _UIA = instance
+        else:
+            _UIA_ERROR[0] = instance.error or 'UIA reported no reason'
+    except Exception as error:  # noqa: BLE001
+        _UIA_ERROR[0] = str(error)
+    return _UIA
+
+
+def uia_tree(hwnd, max_nodes):
+    """
+    The semantic tree if UIA can read this window, else (None, reason).
+
+    The two engines answer different questions: UIA knows what a control *is*, Win32
+    only knows that a child window exists. Preferring UIA is what makes modern apps
+    legible — but a window with no accessibility support must still fall back, not
+    come back empty.
+    """
+    api = get_uia()
+    if not api:
+        return None, _UIA_ERROR[0] or 'UI Automation is unavailable'
+    try:
+        nodes, complete, _window = api.tree(hwnd, max_nodes)
+    except Exception as error:  # noqa: BLE001
+        return None, str(error)
+    if not nodes:
+        return None, 'this window exposes nothing through UI Automation'
+    for node in nodes:
+        node['id'] = node.pop('ref')
+        node['engine'] = 'uia'
+    return (nodes, complete), None
+
+
+def uia_element(ref):
+    api = get_uia()
+    if not api:
+        raise RuntimeError('"%s" is a UI Automation ref, but UIA is unavailable here: %s' % (ref, _UIA_ERROR[0]))
+    return api.element_for(ref)
+
+
+def act_on_uia_element(action, ref, payload, isolated):
+    """
+    Act on a semantic element.
+
+    Patterns first: Invoke/Toggle/Select/SetValue are what accessibility itself uses, so
+    they work on controls that ignore posted mouse messages, and they do not depend on
+    the element being visible on screen. Posting a click at its rectangle is the last
+    resort, and only when the element owns a real window handle.
+    """
+    api = get_uia()
+    element = uia_element(ref)
+    info = api.describe(element)
+
+    if action == 'click':
+        for name in ('invoke', 'toggle', 'select', 'expand'):
+            done = getattr(api, name)(element)
+            if done:
+                return {'via': 'UIA ' + done, 'ref': ref, 'name': info['name']}
+        fallback = None
+        hwnd = info['nativeWindowHandle']
+        if hwnd and user32.IsWindow(hwnd):
+            rect = info['rect']
+            fallback = click_at(hwnd, max(1, rect['width'] // 2), max(1, rect['height'] // 2))
+        if fallback:
+            return {'via': 'posted click at its centre (no Invoke pattern)', 'ref': ref, 'name': info['name']}
+        raise RuntimeError(
+            '"%s" (%s "%s") offers no Invoke/Toggle/Select pattern and owns no window, so there is '
+            'nothing to click. Read it with desktop_act action "read", or act on its window instead.'
+            % (ref, info['kind'], info['name'])
+        )
+
+    if action == 'type':
+        text = str(payload.get('text') or '')
+        done = api.set_value(element, text)
+        if done:
+            return {'via': 'UIA ' + done, 'ref': ref, 'chars': len(text)}
+        # No Value pattern. Plenty of classic controls are like that (Notepad's own
+        # editor), and they are still perfectly writable through their window.
+        hwnd = info['nativeWindowHandle']
+        if hwnd and user32.IsWindow(hwnd):
+            if class_of(hwnd).lower().startswith(('edit', 'richedit')):
+                buffer = ctypes.create_unicode_buffer(text)
+                if send_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(buffer)) is not None:
+                    return {'via': 'WM_SETTEXT on the element window (no Value pattern)', 'ref': ref, 'chars': len(text)}
+            api.focus(element)
+            for char in text:
+                post(hwnd, WM_CHAR, ord(char), 1)
+                time.sleep(0.005)
+            return {'via': 'WM_CHAR after focus (no Value pattern)', 'ref': ref, 'chars': len(text)}
+        raise RuntimeError(
+            '"%s" (%s) has no Value pattern and no window handle, so text cannot be put into it.'
+            % (ref, info['kind'])
+        )
+
+    if action == 'read':
+        value = api.value_of(element)
+        if value is not None:
+            return {'text': value[:4000], 'via': 'UIA Value pattern'}
+        text = api.text_of(element)
+        if text is not None:
+            return {'text': text[:4000], 'via': 'UIA Text pattern'}
+        # Last resort: the element's own window still knows its text.
+        hwnd = info['nativeWindowHandle']
+        if hwnd and user32.IsWindow(hwnd):
+            try:
+                content = read_text(hwnd)
+                if content:
+                    return {'text': content[:4000], 'via': 'WM_GETTEXT on the element window'}
+            except Exception:  # noqa: BLE001 - a hung control must not fail the read
+                pass
+        return {
+            'text': info['name'][:4000],
+            'via': 'name only',
+            'note': 'this element exposes neither a Value nor a Text pattern, and its window returns no text — '
+                    'only its accessible name is available',
+        }
+
+    if action == 'focus':
+        api.focus(element)
+        return {'focused': True, 'ref': ref, 'note': 'UIA SetFocus, no window raised'}
+
+    raise RuntimeError('action "%s" does not apply to a UI Automation element (try click/type/read/focus)' % action)
+
+
 # --- command dispatch ------------------------------------------------------
 
 def handle(payload, isolated=None):
     cmd = str(payload.get('cmd') or '').strip().lower()
     if cmd == 'ping':
+        api = get_uia()
         return {'python': sys.version.split()[0], 'platform': sys.platform,
                 'arch': '64' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32',
-                'desktop': isolated.name if isolated else 'user'}
+                'desktop': isolated.name if isolated else 'user',
+                'uia': bool(api), 'uiaError': _UIA_ERROR[0] or None}
     if cmd == 'windows':
         desktop = isolated.name if isolated else 'user'
         return {'windows': list_windows(desktop, payload.get('process'))}
@@ -731,15 +880,38 @@ def handle(payload, isolated=None):
         if not user32.IsWindow(hwnd):
             raise RuntimeError('window "%s" is gone' % payload.get('window'))
         info = window_info(hwnd, isolated.name if isolated else 'user')
-        return {'window': info, 'controls': control_tree(hwnd), 'clientOrigin': client_origin(hwnd)}
+        engine = 'win32'
+        controls = []
+        complete = True
+        note = None
+        if str(payload.get('engine') or '').lower() != 'win32':
+            answer, reason = uia_tree(hwnd, int(payload.get('max') or 200))
+            if answer:
+                controls, complete = answer
+                engine = 'uia'
+            else:
+                note = reason
+        if not controls:
+            # Deliberately no clear_refs() here: a Win32 tree does not touch the UIA ref
+            # table, so asking for one must not invalidate refs the caller still holds.
+            controls = control_tree(hwnd)
+        return {'window': info, 'controls': controls, 'engine': engine,
+                'complete': complete, 'uiaNote': note,
+                'clientOrigin': client_origin(hwnd)}
     if cmd == 'read':
-        hwnd = parse_id(payload.get('target') or payload.get('window'))
+        wanted = str(payload.get('target') or payload.get('window') or '')
+        if wanted.startswith('u'):
+            return act_on_uia_element('read', wanted, payload, isolated)
+        hwnd = parse_id(wanted)
         return {'text': read_text(hwnd)[:4000]}
     if cmd == 'shot':
         hwnd = parse_id(payload.get('window'))
         return capture(hwnd, payload['path'], payload.get('clientOnly', True))
     if cmd == 'act':
         action = str(payload.get('action') or 'click').lower()
+        raw_target = str(payload.get('target') or '')
+        if raw_target.startswith('u'):
+            return act_on_uia_element(action, raw_target, payload, isolated)
         target = parse_id(payload.get('target')) if payload.get('target') else None
         window = parse_id(payload.get('window')) if payload.get('window') else None
         subject = target or window

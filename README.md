@@ -92,8 +92,8 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `browser_attach` | 接管**已经在运行**的应用（DSH 自己、Chrome、VS Code…）：用它的 DevTools 端口，不需要 token |
 | `browser_close` | 关掉私有浏览器（profile 保留，下次复用）；接管模式下调它只是松手，不会关掉那个应用 |
 | `desktop_windows` | 列出**原生窗口**：自己的桌面 + 本插件开的隔离桌面，带进程、pid、尺寸 |
-| `desktop_tree` | 读一个原生窗口里的控件（按钮、输入框、列表、标签），给它们 id 供后续操作 |
-| `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。不移动真实鼠标、不抢焦点 |
+| `desktop_tree` | 读一个原生窗口的**语义控件树**（UI Automation）：角色、名字、`u1` 这样的 ref；读不到再退回 Win32 子窗口 |
+| `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。`u…` ref 走控件自己的模式（Invoke / Value），不移动鼠标、不抢焦点 |
 | `desktop_shot` | 截一个原生窗口（客户区），窗口被遮住、最小化以外的情形都能画出来 |
 | `desktop_launch` | 启动一个本机程序，默认放进**隔离桌面**：正常运行，但窗口不出现在你屏幕上 |
 
@@ -187,7 +187,23 @@ desktop_act  { action:"read", target } → 读回来，确认真的写进去了
 
 **截图**用 `PrintWindow` 让程序自己画到我们的位图里，所以窗口被遮住也能截；最小化的窗口没东西可画，会直接说而不是给一张黑图。
 
-**能看到什么**：经典 Win32 控件（记事本的编辑框、系统对话框的按钮、资源管理器的部分控件）。现代应用（Chromium / WPF / Electron）整窗自绘，控件树是空的——这时用 `desktop_shot` 看图 + `x`/`y` 点击。真正的 UIA 语义树（能读出 Word 的段落、微信的会话列表）是另一件事，见 Roadmap。
+**看得到什么，取决于走哪条路。** 先试 **UI Automation**（Windows 的无障碍接口，读屏软件用的那套）：它给出角色、名字和可操作模式的**语义树**。同一个记事本窗口——
+
+```text
+Win32 子窗口枚举   2 个   （就两个 HWND）
+UI Automation     21 个   （文本编辑器 / 状态栏 / 垂直滚动条 / 上一行 / 下一行 /
+                            菜单栏 文件(F)·编辑(E)·格式(O)·查看(V)·帮助(H) / 最小化 最大化 关闭 …）
+```
+
+读不到才退回 Win32 子窗口枚举（想强制老路：`desktop_tree { "engine": "win32" }`）。
+
+`u1`、`u2` 这类 ref 是**语义元素**，动它们用的是控件自己暴露的模式：
+
+- **点击** → `Invoke` / `Toggle` / `Select` / `Expand`。不移动指针、不抢焦点，窗口被别的窗口盖住也照样生效；只有在控件一个模式都不给、但自己有窗口时才退回 posted 点击。
+- **输入** → `Value.SetValue`；没有值模式的老控件（记事本的编辑框就是）改用它的窗口消息写。
+- **读** → `Value` → `Text` → 窗口消息，三级降级。三级都不行时只说"只有名字可用"，**不会把名字当成内容返回**。
+
+纯 canvas 自绘、或者没开无障碍的 Electron，两边都是空壳：那时用 `desktop_shot` 看图 + 坐标点击；如果它是 Chromium/Electron，**优先 `browser_attach`**，那是 DOM 级别的精确。
 
 **为什么是 Python**：UIA 那条路（.NET `UIAutomationClient`）控件树更丰富，但开发环境里 `Add-Type` 一类调用被沙箱拦死，**一条命令都验证不了**。与其交付一堆没跑过的自动化代码，不如用一条每条断言都实跑过的路。
 
@@ -248,7 +264,9 @@ live（真实网站）
 - **大到超出 `browser_download` 默认 30 秒预算的文件**不会等完 —— 它会如实说「still downloading」，稍后再查即可，文件继续在后台传。
 - **浏览器自己的界面页不算标签页。** `edge://`、`chrome://` 这类地址不列在 `browser_tabs` 里、也不会被自动跟随：那是浏览器 UI，不是网页，驱动它没有意义。它们照样占着一个真实标签页，所以「标签页数量」可能比你看到的多。
 - **桌面平面需要 Python 3（只用标准库）。** 找不到时它会明确报"不可用"，浏览器侧照常工作。`desktop: false` 可以彻底关掉。
-- **现代自绘窗口没有控件树。** Chromium / WPF / Electron 整窗只有一个顶层 HWND，`desktop_tree` 会是空的。这时用 `desktop_shot` 看图 + `x`/`y` 点击。真正的语义树要 UIA，见 Roadmap。
+- **UI Automation 能读的地方有语义树，读不到退回 Win32。** WPF / WinForms / 老 Win32 都在前者；纯 canvas 自绘、没开无障碍的 Electron 两边都空，只能截图 + 坐标（Chromium 系用 `browser_attach` 更准）。
+- **UIA 的 ref 只对最近一次 `desktop_tree` 有效。** UI 变了就重新读：旧 `u…` 会明确报 `no element "u7" in the last snapshot`，不会静默点错地方。
+- **少数控件两种文本模式都没有**（既无 `Value` 也无 `Text`，窗口也不吐文字）。这时 `read` 会明说"只有名字"，不会假装读到了内容。
 - **posted 消息不是真实输入。** 少数应用只认 `SendInput`（真实输入），会忽略 `PostMessage`。这条路**故意不默认走**：真实输入必然要抢前台，那就不是"后台"了。
 - **最小化的窗口截不到内容**（没有东西被绘制），会直接报错而不是给黑图。`desktop_launch` 启动的程序默认不最小化。
 - **隔离桌面里的程序你用肉眼看不到。** 这是它的用途，但也意味着出了问题只能靠 `desktop_windows` / `desktop_tree` / `desktop_shot` 观察。想看着它跑，`isolated: false`。
@@ -268,7 +286,7 @@ live（真实网站）
 - [x] **元素截图裁剪**（`Page.captureScreenshot` + `clip`）：按 ref / 选择器 / 区域出图，`scale` 可放大
 - [x] **跨域 iframe**：不同源同站走 `Page.createIsolatedWorld`，跨站（独立进程）走 `Target.attachToTarget` + `sessionId`，快照 / 文字 / 等待 / 点击 / 输入 / 上传全部打通
 - [x] **桌面平面（v1）**：`desktop_windows` / `desktop_tree` / `desktop_act` / `desktop_shot` / `desktop_launch`；隔离桌面（`CreateDesktopW` + 桌内 worker）里枚举、绘制、发消息，不抢前台
-- [ ] **桌面平面 v2（UIA）**：`UIAutomationClient` 能给出现代应用的语义树（Word 的段落、微信的会话列表），比 Win32 子窗口枚举强得多。这一版没做是因为开发环境里 .NET 动态加载被拦，无法验证
+- [x] **桌面平面 v2（UI Automation）**：语义树 + 通过控件模式操作。走**裸 COM**（`IUIAutomation` 的 vtable），不依赖 .NET 也不依赖 `comtypes`——这样在这个环境里能逐条验证，而不是交付一段没跑过的代码
 - [ ] 桌面平面的**真实输入**可选模式（`SendInput` + 主动抢前台），给那些忽略 posted 消息的应用
 - [x] **`browser_attach`**：接管已经在运行的 Chromium/Electron（DSH 自己的界面就是这样被驱动的），不新建标签页、不改尺寸、不关进程
 - [ ] 跨域 iframe 里的 `browser_eval`（现在只在主文档执行）
@@ -289,7 +307,7 @@ node tests/live.mjs https://github.com
 `tests/iframe-fixture.mjs` 起两个真实 HTTP 端口造同源 + 跨域框架——`file://` 页面之间全都是不透明源，用它测同源等于什么都没测。
 `tests/download-fixture.mjs` 也一样：`Content-Disposition` 定名和"下载中的状态"只有真实 HTTP 响应能有，`file://` 触发不了下载。
 `tests/png.mjs` 是给测试用的最小 PNG 解码器：裁剪截图对不对只能看**像素**（长度和尺寸都能骗人）。
-`tests/desktop.mjs` 会在**隔离桌面**上真的开一个记事本和一个系统对话框：断言全部来自数据（窗口列表、控件文字、截图像素），不依赖"人看一眼"；跑完自己把进程和桌面清掉。
+`tests/desktop.mjs` 会在**隔离桌面**上真的开一个记事本和一个系统对话框：断言全部来自数据（语义树、控件文字、截图像素、`UIA Invoke` 之后窗口是否消失），不依赖"人看一眼"；跑完自己把进程和桌面清掉。
 
 代码结构：
 
@@ -299,7 +317,7 @@ lib/page.js     页面操作（快照 / 点击 / 输入 / 键盘 / 截图与裁�
 lib/frames.js   页面 / 自己进程 / 独立进程三层框架的发现、隔离世界、坐标换算、跨帧等待与上传
 lib/desktop.js  桌面 helper 的客户端（JSON 管道、python 探测、空闲回收）
 lib/index.js    插件入口：apply(ctx, config) 与 24 个工具定义
-helpers/        desktop-agent.py —— Win32 + ctypes，隔离桌面的 worker 也在这个文件里
+helpers/        desktop-agent.py —— Win32 + ctypes；uia.py —— UI Automation 走裸 COM（无第三方依赖）
 tests/          端到端验证
 ```
 
@@ -365,3 +383,25 @@ tests/          端到端验证
 ## License
 
 MIT
+
+---
+
+## 附：为什么 UI Automation 走裸 COM
+
+UIA 的常规入口是 .NET（`System.Windows.Automation`）或 `comtypes`。两条路在这个环境里都不成立：
+前者要 `Add-Type` / `Reflection.Assembly`（被沙箱拦死，一条命令都验证不了），后者是第三方依赖。
+
+但 UIA 本身就是个 COM 对象：`CoCreateInstance(CLSID_CUIAutomation, IID_IUIAutomation)`，之后每个方法
+就是 vtable 上固定位置的一个函数指针。所以 `helpers/uia.py` 直接按槽位调用：
+
+| 调用 | 槽 | 用途 |
+|---|---|---|
+| `IUIAutomation::GetRootElement` | 5 | 桌面根 |
+| `ElementFromHandle` | 6 | 窗口 → 元素 |
+| `get_ControlViewWalker` | 14 | 遍历器（跳过纯装饰节点） |
+| `CreateTrueCondition` | 21 | 无过滤条件 |
+| `Element::get_CurrentName / ControlType / BoundingRectangle` | 23 / 21 / 43 | 读属性 |
+| `Element::GetCurrentPattern` | 16 | 拿模式对象，再 `QueryInterface` 到 `IInvokePattern` 等 |
+
+坑集中在三处：BSTR 要 `SysFreeString`、遍历器返回的每个元素要 `Release`、COM 必须在自己线程
+`CoInitializeEx`（worker 模式下是另一个进程，各初始化一次）。
