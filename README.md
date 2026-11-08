@@ -95,6 +95,7 @@ dsh plugin --profile web add github:y123546/dsh-computer-use-bg
 | `desktop_tree` | 读一个原生窗口的**语义控件树**（UI Automation）：角色、名字、`u1` 这样的 ref；读不到再退回 Win32 子窗口 |
 | `desktop_act` | 点 / 输入 / 按键 / 滚动 / **读文本框内容** / 关闭。`u…` ref 走控件自己的模式（Invoke / Value），不移动鼠标、不抢焦点 |
 | `desktop_shot` | 截一个原生窗口（客户区），窗口被遮住也能画出来；`grid: true` 会在图上叠一把像素标尺 |
+| `desktop_find` | 在**没有控件树**的窗口里找东西并给出**可点的坐标**：按文字（系统自带 OCR）或按颜色（图标按钮就是一块纯色） |
 | `desktop_launch` | 启动一个本机程序，默认放进**隔离桌面**：正常运行，但窗口不出现在你屏幕上 |
 
 `ref` 编号每次快照都会重排 —— 页面变了就重新 `browser_snapshot`，别用旧编号。
@@ -244,6 +245,24 @@ desktop_act  { "window": "w004e0592", "x": 412, "y": 96 }
 
 另外两个信号仍然有用：有没有**新窗口**冒出来（点按钮弹对话框时，父窗口像素可以一点不变）、窗口是不是**已经关掉**了。
 
+**4. 找，而不是估。** 上面三条都在让"估"更可靠；`desktop_find` 干脆不估了。画出来的界面只有两种线索，它两种都收：
+
+```text
+desktop_find { "window": "...", "text": "START" }
+→ "START" at (74, 91) 78x16 — centre (105, 99)
+desktop_find { "window": "...", "color": "#2f6f4f" }
+→ #2f6f4f at (60, 71) 140x54 — centre (130, 98)
+```
+
+文字走 **Windows 自带的 OCR**（`Windows.Media.Ocr`，装了语言包就能用，不用额外装任何东西），返回的是**文字加上它的外接矩形**；颜色走像素扫描，图标按钮本来就是一块纯色。两者都在客户区坐标系里，`desktop_act` 拿去就能点。
+
+几个刻意设计的地方：
+
+- **近似匹配**。OCR 不是查表：canvas 上画出来的 `START 0`，它有时读成 `STARTO`（吃掉空格）。要求精确命中就会对明明在屏幕上的按钮回答"找不到"，那是唯一没法用的答案。所以先子串、再按相似度（≥0.75）兜。
+- **找不到时报告读到了什么**。空列表没法排查，"这张图上是这些字"能。
+- **颜色盖住整窗时会拦下来**。默认容差会把背景也算进去，这时返回的"中心"是随便一个位置——工具会说"这是背景不是控件"，让你缩小范围或降容差。
+- **OCR 不可用不影响颜色搜索**，反之亦然；两者都用不了时说清楚原因（没装语言包 / 脚本执行被限制）。
+
 > **平台边界（实测，非实现取舍）**：隔离桌面（`desktop_launch` 默认）上的合成窗口**根本不会被绘制**——它在 DWM 眼里不存在，`PrintWindow` 拿到的永远是空白，五种 flag 组合、强制重绘、移动窗口全试过，都一样。所以要在看不见的桌面上操作 Chromium / 游戏这类自绘应用，只能 `isolated: false`，或者干脆用 `browser_attach`（那才是这类应用的正当入口）。记事本、对话框这类 GDI 绘制的原生控件在隔离桌面上完全没有这个问题。
 
 ### Electron / Chromium：空壳是可以打开的
@@ -354,10 +373,11 @@ Chromium 的无障碍树（同一个窗口，本插件的 UIA 读）
 - [x] **跨域 iframe**：不同源同站走 `Page.createIsolatedWorld`，跨站（独立进程）走 `Target.attachToTarget` + `sessionId`，快照 / 文字 / 等待 / 点击 / 输入 / 上传全部打通
 - [x] **桌面平面（v1）**：`desktop_windows` / `desktop_tree` / `desktop_act` / `desktop_shot` / `desktop_launch`；隔离桌面（`CreateDesktopW` + 桌内 worker）里枚举、绘制、发消息，不抢前台
 - [x] **桌面平面 v2（UI Automation）**：语义树 + 通过控件模式操作。走**裸 COM**（`IUIAutomation` 的 vtable），不依赖 .NET 也不依赖 `comtypes`——这样在这个环境里能逐条验证，而不是交付一段没跑过的代码
-- [x] **无控件树时的闭环**：像素标尺（`grid`）+ 动作前后对比（重绘区域 / 新窗口 / 已关闭 / 什么都没变）
+- [x] **无控件树时的闭环**：像素标尺（`grid`）+ 动作前后对比（噪声 vs 信号 / 新窗口 / 已关闭 / 什么都没变）
+- [x] **按内容定位**（`desktop_find`）：文字用系统 OCR、图标用颜色，返回可直接点击的客户区坐标
 - [x] **让 Chromium 应用发布原生无障碍树**（CDP `Accessibility.enable`）：Electron 的"空壳"从此可读，且对任何 UIA 工具生效
 - [ ] 桌面平面的**真实输入**可选模式（`SendInput` + 主动抢前台），给那些忽略 posted 消息的应用
-- [ ] 本地 OCR（Windows 自带 `Windows.Media.Ocr`）把"看图估坐标"升级成"按文字找控件"——需要 WinRT 绑定，成本较高
+- [x] **本地 OCR**（`desktop_find`）：Windows 自带的 `Windows.Media.Ocr` 读出文字**和它的外接矩形**，"按钮在 (412,96)"从估计变成查表；用系统脚本宿主的 WinRT 投影调用，不引入任何依赖
 - [x] **`browser_attach`**：接管已经在运行的 Chromium/Electron（DSH 自己的界面就是这样被驱动的），不新建标签页、不改尺寸、不关进程
 - [ ] 跨域 iframe 里的 `browser_eval`（现在只在主文档执行）
 
@@ -369,7 +389,7 @@ node tests/tools.mjs          # 工具接线：每个返回值都用自己的 ou
 node tests/idle.mjs           # 空闲回收：进程确实会退出
 node tests/smoke.mjs          # CDP 层端到端：点击/输入/键盘/截图/裁剪/等待/对话框/上传/导航/hover/拖拽/拖文件/跨域 iframe/下载/标签页（30 步）
 node tests/desktop.mjs        # 桌面平面端到端：隔离桌面里启动记事本/对话框，读控件、输入、回读、截图、点击关窗
-node tests/canvas.mjs         # 无控件树端到端：真 Chromium 窗口里跑 canvas 场景，截图定位 → 点中 / 点空 / 点在噪声区
+node tests/canvas.mjs         # 无控件树端到端：真 canvas 场景，截图定位 → 点中 / 点空 / 点在噪声区 → 按颜色和文字搜索
 node tests/live.mjs           # 真实站点：导航 + 点击跳转
 node tests/live.mjs https://github.com
 ```
@@ -487,3 +507,9 @@ UIA 的常规入口是 .NET（`System.Windows.Automation`）或 `comtypes`。两
 38. **整窗像素比较在有动画的界面上会给出反向结论。** 实测同一个 canvas：点中按钮变化 0.7%，点空白变化 2.7%——数字是反的，因为点空白那次动画正好滚过去了。判据必须是"信号 vs 这块区域自己的噪声"，而且噪声要在动作前实测（连拍三帧），不能假设为零。
 39. **三帧基线也救不了"缓慢移动的大色块"。** 条纹宽 64px、每帧移 5px，三帧间隔 70ms 只移动 9px，条纹内部像素三帧同色 → 被判成静止 → 动作后再变就记成"点击生效"。降到阈值 8 反而更糟。这是像素法本身的上限，不是参数问题，所以判定改成"先量噪声再比"，噪声高就明说不能作证。
 40. **测试里的动态元素必须圈在自己的地盘。** canvas 里的球原本横扫整块画布，偶尔滚过"静止面板"，于是"这里什么都没变"变成间歇性失败——症状和验证逻辑坏掉一模一样。把球限制在固定 band 之后连跑三次全绿。
+
+41. **WinRT 的 `GetFileFromPathAsync` 不接受正斜杠。** 传 `F:/Temp/a.png` 得到的是一句 `AggregateException`（真正的异常被包在异步结果里），看上去像权限问题或 OCR 引擎坏了。必须 `os.path.normpath`。这一条花了两次往返才定位到。
+42. **系统的脚本宿主里，WinRT 异步操作没有自动投影。** `[Windows.Media.Ocr.OcrEngine]` 这类类型能直接用，但返回的 `IAsyncOperation` 是个 `__ComObject`，没有 `.GetResults()`、`.Status` 也是空的。要么用 `AsTask` 扩展（在 `System.Runtime.WindowsRuntime` 里，得先加载程序集），要么改用 `ctypes` 直接打 vtable——后者要先从 `.winmd` 里挖出接口 IID。选前者：一次进程启动换零依赖。
+43. **`.ps1` 默认跑不起来。** 执行策略会直接拒绝，报"在此系统上禁止运行脚本"。所有调用都要带 `-ExecutionPolicy Bypass`，并且 `-NoProfile -NonInteractive` + `CREATE_NO_WINDOW`，否则会在用户面前闪一个控制台窗口。
+44. **OCR 会认错字，而且错得不规律。** canvas 上画出来的 `START 0`，同一台机器、同一个引擎，有时读成 `START`，有时读成 `STARTO`。要求精确命中就会对明明在屏幕上的按钮回答"找不到"——所以匹配是"先子串、再相似度 ≥0.75"。反过来，短于 4 个字符的查询不做模糊，否则什么都匹配得上。
+45. **颜色搜索的容差会把背景一起吃进去。** 默认 24 时，面板色 `#1a2430` 把窗口底色 `#101318` 也算了进来，返回一个 904x645 的"块"，中心点指向任意位置。判据不是"有没有匹配"，而是**匹配面积占窗口的比例**——超过 60% 就直接告诉调用方"这是背景，不是控件"。

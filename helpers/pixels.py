@@ -246,6 +246,64 @@ def colours(shot, step=8, ceiling=64):
     return len(seen)
 
 
+def find_colour(shot, target, tolerance=24, region=None, step=2, floor=3):
+    """
+    Bounding box of everything close to one colour.
+
+    A flat rectangle of known colour is the one thing a painted UI does expose reliably —
+    a button is a block of pixels, whatever it draws inside. This turns that into a
+    coordinate instead of an estimate.
+
+    Scanned coarsely first and refined inside the hit box: a full-resolution sweep of a
+    4K window in Python is slow enough to be felt, while a coarse pass plus a local
+    refinement finds the same box in a fraction of the time. `hits` reports how many
+    samples matched, so a single stray pixel is not mistaken for a button.
+    """
+    width, height = shot['width'], shot['height']
+    rgb = shot['rgb']
+    stride = width * 3
+    tr, tg, tb = int(target[0]), int(target[1]), int(target[2])
+    x0, y0, x1, y1 = _bounds(region, width, height)
+
+    def sweep(step_size, left, top, right, bottom):
+        found = []
+        for y in range(top, bottom, step_size):
+            row = y * stride
+            for x in range(left, right, step_size):
+                i = row + x * 3
+                if abs(rgb[i] - tr) <= tolerance and abs(rgb[i + 1] - tg) <= tolerance and abs(rgb[i + 2] - tb) <= tolerance:
+                    found.append((x, y))
+        return found
+
+    hits = sweep(step, x0, y0, x1, y1)
+    if len(hits) < floor:
+        hits = sweep(1, x0, y0, x1, y1)
+    if not hits:
+        return None
+
+    min_x = min(point[0] for point in hits)
+    max_x = max(point[0] for point in hits)
+    min_y = min(point[1] for point in hits)
+    max_y = max(point[1] for point in hits)
+
+    # Grow the box back out to the true edges: the coarse pass lands inside it.
+    pad = step + 1
+    edge = sweep(1, max(0, min_x - pad), max(0, min_y - pad), min(width, max_x + pad + 1), min(height, max_y + pad + 1))
+    if edge:
+        min_x = min(point[0] for point in edge)
+        max_x = max(point[0] for point in edge)
+        min_y = min(point[1] for point in edge)
+        max_y = max(point[1] for point in edge)
+
+    return {
+        'x': min_x,
+        'y': min_y,
+        'width': max_x - min_x + 1,
+        'height': max_y - min_y + 1,
+        'hits': len(hits),
+    }
+
+
 # --- comparison ------------------------------------------------------------   
 
 def _bounds(region, width, height):

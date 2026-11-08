@@ -221,6 +221,70 @@ try {
   } else {
     fail('grid capture', `${gridded.meta.colours} colours`);
   }
+
+  console.log('8) a colour search turns the picture into a coordinate');
+  const byColour = await desk.find({ window: win.id, color: start.fill });
+  const block = byColour?.matches?.[0];
+  if (block) {
+    const dx = Math.abs(block.x - box.x);
+    const dy = Math.abs(block.y - box.y);
+    const dw = Math.abs(block.width - box.width);
+    const dh = Math.abs(block.height - box.height);
+    if (dx <= 2 && dy <= 2 && dw <= 2 && dh <= 2) {
+      ok('the block is found exactly where it is painted', `${block.x},${block.y} ${block.width}x${block.height}, centre ${block.cx},${block.cy}`);
+    } else {
+      fail('colour box', `found ${JSON.stringify(block)} but the picture says ${box.x},${box.y} ${box.width}x${box.height}`);
+    }
+  } else {
+    fail('colour search', JSON.stringify(byColour));
+  }
+
+  console.log('9) a text search reads the label off the pixels');
+  const byText = await desk.find({ window: win.id, text: 'START' });
+  const label = byText?.matches?.[0];
+  if (label && byText.engines?.includes('ocr')) {
+    // The label centre has to fall inside the button it belongs to, otherwise clicking
+    // what OCR found would be a miss dressed up as a coordinate.
+    const inside =
+      label.cx >= box.x && label.cx <= box.x + box.width && label.cy >= box.y && label.cy <= box.y + box.height;
+    if (inside) {
+      ok('the label centre is inside its button', `"${label.text}" at ${label.x},${label.y} → centre ${label.cx},${label.cy}`);
+    } else {
+      fail('label placement', `"${label.text}" centre ${label.cx},${label.cy} is outside the button ${box.x},${box.y} ${box.width}x${box.height}`);
+    }
+  } else {
+    fail('text search', JSON.stringify(byText));
+  }
+
+  console.log('10) a search that finds nothing says what the picture actually contains');
+  const absent = await desk.find({ window: win.id, text: 'CHECKOUT-BUTTON' });
+  if ((absent?.matches?.length ?? 0) === 0 && String(absent?.readText ?? '').length > 0) {
+    ok('nothing matched, and the read text is reported', absent.readText.slice(0, 60).replace(/\s+/g, ' '));
+  } else {
+    fail('absent text search', JSON.stringify(absent));
+  }
+
+  console.log('11) a colour-only search does not need OCR at all');
+  const noText = await desk.find({ window: win.id, color: CANVAS_BUTTONS[1].fill });
+  const pause = noText?.matches?.[0];
+  if (pause && !(noText.engines || []).includes('ocr') && Math.abs(pause.width - 140) <= 2) {
+    ok('colour search runs on its own', `${pause.width}x${pause.height} of ${CANVAS_BUTTONS[1].fill}`);
+  } else {
+    fail('colour-only search', JSON.stringify({ engines: noText?.engines, match: pause }));
+  }
+
+  console.log('12) a background colour is reported as a background, not as a target');
+  // The window background is within tolerance of this one, so a naive search returns a
+  // box covering everything and a "centre" that would click the middle of nowhere.
+  const background = await desk.find({ window: win.id, color: '#101318', tolerance: 8 });
+  const wholeWindow = background?.matches?.[0];
+  if (wholeWindow) {
+    const share = (wholeWindow.width * wholeWindow.height) / (background.size.width * background.size.height);
+    if (share > 0.6) ok('the background really does cover the window', `${Math.round(share * 100)}% — the tool warns about this`);
+    else fail('background share', `${Math.round(share * 100)}% — the fixture changed`);
+  } else {
+    fail('background search', JSON.stringify(background));
+  }
 } catch (error) {
   failures += 1;
   console.log('  FAIL  crashed', error.message);

@@ -30,6 +30,7 @@ import ctypes
 import json
 import os
 import socket
+import tempfile
 import struct
 import subprocess
 import sys
@@ -38,6 +39,9 @@ import time
 import zlib
 from ctypes import wintypes
 
+import difflib
+
+import ocr
 import pixels
 
 IS_WINDOWS = sys.platform.startswith('win')
@@ -471,6 +475,23 @@ def read_text(target):
 
 # --- screenshot ------------------------------------------------------------
 
+def grab_stable(hwnd, client_only=True):
+    """
+    Capture twice and keep the richer frame.
+
+    A composited window's first PrintWindow returns the surface it had *before* this call
+    nudged it to paint: measured 10 distinct colours (title bar only), then 64 (the real
+    content), with both calls reporting success. One capture is indistinguishable from an
+    empty application, so every path that reads pixels goes through here — a second copy
+    of this logic elsewhere is how `find` once searched a blank frame and reported
+    "no matches" for text that was plainly on screen.
+    """
+    shot = pixels.grab(hwnd, client_only)
+    time.sleep(0.06)
+    second = pixels.grab(hwnd, client_only)
+    return second if pixels.colours(second) > pixels.colours(shot) else shot
+
+
 def capture(hwnd, path, client_only=True, grid=False):
     """
     Draw a window into a bitmap without showing it, optionally with a ruler on top.
@@ -480,18 +501,7 @@ def capture(hwnd, path, client_only=True, grid=False):
     painted, and a few GPU-composited apps hand back an empty frame; both are reported
     as such instead of shipping a blank image.
     """
-    shot = pixels.grab(hwnd, client_only)
-
-    # Take it twice and keep the richer frame. Measured on a composited window: the first
-    # PrintWindow returns the surface the window had *before* this call nudged it to
-    # paint, and the second returns the real thing (10 distinct colours, then 64). Without
-    # the retry the caller gets a plausible-looking blank image and no error anywhere.
-    if pixels.colours(shot) <= 24:
-        time.sleep(0.1)
-        second = pixels.grab(hwnd, client_only)
-        if pixels.colours(second) > pixels.colours(shot):
-            shot = second
-
+    shot = grab_stable(hwnd, client_only)
     rgb = shot['rgb']
     if grid:
         # The ruler exists for the case with no accessibility tree: estimating a pixel
@@ -901,6 +911,156 @@ def start_isolated(name, script_path):
     return Isolated(name, int(info.dwProcessId), conn)
 
 
+# --- finding things in a picture -------------------------------------------
+
+def parse_colour(value):
+    """#rrggbb, rrggbb or rgb(r,g,b) into a triple. Anything else is a caller mistake."""
+    raw = str(value or '').strip().lower()
+    if raw.startswith('rgb(') and raw.endswith(')'):
+        parts = [piece.strip() for piece in raw[4:-1].split(',')]
+        if len(parts) >= 3:
+            return tuple(max(0, min(255, int(float(piece)))) for piece in parts[:3])
+    raw = raw.lstrip('#')
+    if len(raw) == 3:
+        raw = ''.join(ch * 2 for ch in raw)
+    if len(raw) != 6:
+        raise RuntimeError('"%s" is not a colour — use #rrggbb' % value)
+    return tuple(int(raw[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def box_of(words):
+    left = min(word['x'] for word in words)
+    top = min(word['y'] for word in words)
+    right = max(word['x'] + word['width'] for word in words)
+    bottom = max(word['y'] + word['height'] for word in words)
+    return {'x': left, 'y': top, 'width': right - left, 'height': bottom - top}
+
+
+def fuzzy_hit(needle, candidate):
+    """
+    Substring first, then approximately equal.
+
+    OCR is not a lookup table: on a painted canvas it read "START 0" as "STARTO", dropping
+    the space. Demanding an exact hit would report "not found" for a button that is
+    plainly on screen, which is the one answer a caller cannot act on.
+    """
+    lowered = str(candidate or '').lower()
+    if needle in lowered:
+        return True
+    if len(needle) < 4:
+        return False  # anything shorter fuzzes into everything
+    return difflib.SequenceMatcher(None, needle, lowered).ratio() >= 0.75
+
+
+def find_in_window(hwnd, payload):
+    """
+    Locate something in a window that has no control tree.
+
+    Two kinds of evidence exist on a painted surface, and only two: text, which the OCR
+    engine Windows ships can read along with its bounding box, and a flat block of colour,
+    which is what an icon button is. Both are reported in client pixels — the same space
+    `desktop_act` takes and the same image `desktop_shot` returns — so a match can be
+    clicked directly instead of being estimated from a picture.
+    """
+    text = str(payload.get('text') or '').strip()
+    colour = str(payload.get('color') or payload.get('colour') or '').strip()
+    if not text and not colour:
+        raise RuntimeError('find needs "text" or "color" — a picture has nothing else to search by')
+
+    region = payload.get('region') if isinstance(payload.get('region'), dict) else None
+    shot = grab_stable(hwnd, True)
+
+    out = {
+        'window': window_info(hwnd, str(payload.get('desktop') or 'user')),
+        'size': {'width': shot['width'], 'height': shot['height']},
+        'engines': [],
+        'matches': [],
+    }
+
+    if colour:
+        target = parse_colour(colour)
+        box = pixels.find_colour(
+            shot, target,
+            tolerance=int(payload.get('tolerance') or 24),
+            region=region,
+        )
+        out['engines'].append('colour')
+        if box:
+            box['kind'] = 'colour'
+            box['color'] = colour
+            box['cx'] = box['x'] + box['width'] // 2
+            box['cy'] = box['y'] + box['height'] // 2
+            out['matches'].append(box)
+
+    if text:
+        if not ocr.available():
+            out['engines'].append('ocr:unavailable')
+            out['ocrReason'] = ocr.status().get('reason')
+        else:
+            temp = os.path.join(
+                tempfile.gettempdir(),
+                'dsh-bg-find-%d-%d.png' % (os.getpid(), int(time.time() * 1000)),
+            )
+            pixels.write_png(temp, shot['width'], shot['height'], shot['rgb'])
+            try:
+                read = ocr.recognise(temp)
+            finally:
+                try:
+                    os.remove(temp)
+                except OSError:
+                    pass
+            out['engines'].append('ocr')
+            out['language'] = read['language']
+            # The full read, trimmed: when a query finds nothing, the useful answer is
+            # "this is what the picture says", not just an empty list.
+            out['readText'] = read['text'][:400]
+            needle = text.lower()
+            limit = int(payload.get('max') or 8)
+
+            # A phrase is matched against the whole line, then words are matched one by
+            # one: "Submit order" should find the line, "Submit" should find the word.
+            by_line = {}
+            for word in read['words']:
+                by_line.setdefault(word['line'], []).append(word)
+
+            hits = []
+            if ' ' in needle:
+                for line, words in by_line.items():
+                    if fuzzy_hit(needle, line):
+                        box = box_of(words)
+                        box.update({'kind': 'line', 'text': line})
+                        hits.append(box)
+            if not hits:
+                for word in read['words']:
+                    if fuzzy_hit(needle, word['text']):
+                        hits.append({
+                            'kind': 'word',
+                            'text': word['text'],
+                            'line': word['line'],
+                            'x': word['x'],
+                            'y': word['y'],
+                            'width': word['width'],
+                            'height': word['height'],
+                        })
+            for box in hits[:limit]:
+                box['cx'] = int(box['x'] + box['width'] / 2)
+                box['cy'] = int(box['y'] + box['height'] / 2)
+                out['matches'].append(box)
+
+    if region:
+        def inside(box):
+            return (
+                box['x'] + box['width'] >= region.get('x', 0)
+                and box['x'] <= region.get('x', 0) + region.get('width', shot['width'])
+                and box['y'] + box['height'] >= region.get('y', 0)
+                and box['y'] <= region.get('y', 0) + region.get('height', shot['height'])
+            )
+
+        out['matches'] = [box for box in out['matches'] if inside(box)]
+
+    return out
+
+
 # --- UI Automation ---------------------------------------------------------
 
 _UIA = None
@@ -1057,7 +1217,9 @@ def handle(payload, isolated=None):
         return {'python': sys.version.split()[0], 'platform': sys.platform,
                 'arch': '64' if ctypes.sizeof(ctypes.c_void_p) == 8 else '32',
                 'desktop': isolated.name if isolated else 'user',
-                'uia': bool(api), 'uiaError': _UIA_ERROR[0] or None}
+                'uia': bool(api), 'uiaError': _UIA_ERROR[0] or None,
+                'ocr': ocr.available(), 'ocrLanguage': ocr.status().get('language'),
+                'ocrError': ocr.status().get('reason')}
     if cmd == 'windows':
         desktop = isolated.name if isolated else 'user'
         return {'windows': list_windows(desktop, payload.get('process'))}
@@ -1090,6 +1252,9 @@ def handle(payload, isolated=None):
             return act_on_uia_element('read', wanted, payload, isolated)
         hwnd = parse_id(wanted)
         return {'text': read_text(hwnd)[:4000]}
+    if cmd == 'find':
+        hwnd = parse_id(payload.get('window'))
+        return find_in_window(hwnd, payload)
     if cmd == 'shot':
         hwnd = parse_id(payload.get('window'))
         return capture(hwnd, payload['path'], payload.get('clientOnly', True), bool(payload.get('grid')))

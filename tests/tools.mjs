@@ -466,7 +466,16 @@ try {
     }
   }
 
-  console.log('17) browser_attach is wired and explains a dead endpoint');
+  console.log('17) desktop_find refuses to guess what to look for');
+  try {
+    await call('desktop_find', { window: 'w00000000' });
+    fail('find with no query', 'it resolved instead of throwing');
+  } catch (error) {
+    if (/Give text or color/.test(error.message)) ok('an empty search is explained', error.message.split('.')[0].slice(0, 80));
+    else fail('find argument check', error.message);
+  }
+
+  console.log('18) browser_attach is wired and explains a dead endpoint');
   try {
     await call('browser_attach', { url: 'http://127.0.0.1:9' });
     fail('attach to a dead endpoint', 'it resolved instead of throwing');
