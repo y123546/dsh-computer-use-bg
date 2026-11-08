@@ -12,6 +12,7 @@ try {
   const conn = await host.page();
   const snap = await snapshotAll(conn);
   const entry = snap.elements.find((el) => el.name === '插件' || el.name === 'Plugins');
+  console.log('plugin entry:', entry ? `${entry.name} @${entry.x},${entry.y}` : 'not found');
   if (entry) await clickAt(conn, entry.x, entry.y);
   await sleep(3200);
 
@@ -49,7 +50,6 @@ try {
   if (ALL) {
     // Walk every fiber in the plugin list once, instead of looking up two names.
     let rows = [];
-    let previous = -1;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       rows = await evaluate(conn, `(() => {
         const seen = new Map();
@@ -73,13 +73,12 @@ try {
         }
         return [...seen.values()];
       })()`);
-      if (rows.length > 0 && rows.length === previous) break;
-      previous = rows.length;
+      if (rows.length >= 20) break;
       await sleep(1500);
     }
     rows.sort((a, b) => String(a.name).localeCompare(String(b.name)));
     for (const row of rows) console.log(`${row.name}: ${JSON.stringify(row)}`);
-    console.log(`total rows: ${rows.length}`);
+    console.log(`total rows: ${rows.length}${rows.length < 20 ? ' — INCOMPLETE: plugin list not visible in the current view' : ''}`);
   } else {
     for (const name of WANTED) {
       let row = null;
