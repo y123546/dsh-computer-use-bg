@@ -481,6 +481,17 @@ def capture(hwnd, path, client_only=True, grid=False):
     as such instead of shipping a blank image.
     """
     shot = pixels.grab(hwnd, client_only)
+
+    # Take it twice and keep the richer frame. Measured on a composited window: the first
+    # PrintWindow returns the surface the window had *before* this call nudged it to
+    # paint, and the second returns the real thing (10 distinct colours, then 64). Without
+    # the retry the caller gets a plausible-looking blank image and no error anywhere.
+    if pixels.colours(shot) <= 24:
+        time.sleep(0.1)
+        second = pixels.grab(hwnd, client_only)
+        if pixels.colours(second) > pixels.colours(shot):
+            shot = second
+
     rgb = shot['rgb']
     if grid:
         # The ruler exists for the case with no accessibility tree: estimating a pixel
@@ -493,6 +504,9 @@ def capture(hwnd, path, client_only=True, grid=False):
         'height': shot['height'],
         'clientOnly': shot['clientOnly'],
         'painted': shot['painted'],
+        # `painted` is PrintWindow's own verdict and it is not enough: a composited window
+        # with nothing rendered still reports True and hands back one flat colour.
+        'colours': pixels.colours(shot),
         'grid': bool(grid),
         'clientOrigin': client_origin(hwnd),
     }
@@ -509,33 +523,112 @@ def top_level(hwnd):
     return root or hwnd
 
 
-def describe_change(anchor, before, windows_before):
-    """
-    What actually changed on screen.
+def box_around(x, y, radius=64):
+    """The area an action is expected to disturb, in client pixels."""
+    return {'x': int(x) - radius, 'y': int(y) - radius, 'width': radius * 2, 'height': radius * 2}
 
-    Two signals, because one is not enough: the window's own pixels (did it repaint?) and
-    the set of visible windows (did a dialog appear?). A click that opens a modal changes
-    the window list while the parent's pixels stay put; a click that only moves a caret
-    changes pixels and adds no window. Reporting both, with how much and where, lets the
-    caller decide instead of trusting a bare "done".
+
+def client_box_of(target, anchor):
+    """A control's rectangle, expressed in the anchor window's client pixels."""
+    rect = None
+    raw = str(target or '')
+    if raw.startswith('u'):
+        api = get_uia()
+        if api:
+            try:
+                r = api.describe(api.element_for(raw))['rect']
+                rect = {'left': r['left'], 'top': r['top'], 'right': r['right'], 'bottom': r['bottom']}
+            except Exception:  # noqa: BLE001 - a bad anchor only costs precision
+                rect = None
+    else:
+        try:
+            hwnd = parse_id(raw)
+            if user32.IsWindow(hwnd):
+                rect = rect_of(hwnd)
+        except Exception:  # noqa: BLE001
+            rect = None
+    if not rect:
+        return None
+    top_left = wintypes.POINT(rect['left'], rect['top'])
+    bottom_right = wintypes.POINT(rect['right'], rect['bottom'])
+    user32.ScreenToClient(anchor, ctypes.byref(top_left))
+    user32.ScreenToClient(anchor, ctypes.byref(bottom_right))
+    return {'x': top_left.x, 'y': top_left.y,
+            'width': max(1, bottom_right.x - top_left.x),
+            'height': max(1, bottom_right.y - top_left.y)}
+
+
+def act_region(payload, anchor):
+    """
+    Where this action should leave a mark.
+
+    Comparing the whole window answers the wrong question on anything that animates: a
+    clock, a cursor, a game loop. The region is what the caller pointed at, so a change
+    inside it means the click landed and a change outside it means the scene moved on.
+    """
+    if not anchor:
+        return None
+    action = str(payload.get('action') or 'click').lower()
+    if action == 'click':
+        x = payload.get('x')
+        y = payload.get('y')
+        if x is not None and y is not None:
+            if (payload.get('origin') or 'client') == 'screen':
+                point = wintypes.POINT(int(x), int(y))
+                user32.ScreenToClient(anchor, ctypes.byref(point))
+                x, y = point.x, point.y
+            return box_around(x, y)
+        return client_box_of(payload.get('target'), anchor)
+    if action == 'type':
+        return client_box_of(payload.get('target'), anchor)
+    return None
+
+
+def describe_change(anchor, baseline, windows_before, region):
+    """
+    What actually changed, judged against the scene's own motion.
+
+    Two signals, because one is not enough: the window's pixels (did the pointed-at area
+    repaint?) and the set of visible windows (did a dialog appear?). A click that opens a
+    modal changes the window list while the parent's pixels stay put; a click that only
+    moves a caret changes pixels and adds no window.
+
+    The two pre-action frames are what make the pixel half trustworthy. Whatever differs
+    between them is the scene animating, and those pixels are excluded from the verdict
+    instead of being reported as a successful click.
     """
     out = {}
-    # A posted click and a UI change are not the same instant: the dialog is destroyed a
-    # frame or two after the button's mouse-up. Grabbing immediately catches the button
-    # still pressed and reports pixels instead of "it closed".
-    time.sleep(0.15)
+    # A posted click and a UI change are not the same instant: a dialog is destroyed a
+    # frame or two after the button's mouse-up, and the repaint lands after that.
+    time.sleep(0.12)
     if anchor and not user32.IsWindow(anchor):
         # It closed: that is a change, and a very definite one.
         out['closed'] = True
         anchor = None
-        before = None
-    if anchor and before is not None:
+    if anchor and baseline:
         try:
             after = pixels.grab(anchor, True)
         except Exception as error:  # noqa: BLE001 - verification must never fail an action
             out['error'] = str(error)
         else:
-            out.update(pixels.diff(before, after))
+            # Two measurements, side by side: what the area did on its own (noise,
+            # measured across the baseline) and what it did around the action (signal).
+            # Their relationship is the only honest verdict available — a slow, large
+            # colour block can move less than the difference threshold between frames
+            # and pass for still, so a bare "changed: true" would be a guess.
+            noise = pixels.diff(baseline[0], baseline[-1], sample=2, region=region)
+            signal = pixels.diff(baseline[-1], after, sample=2, region=region)
+            still = pixels.diff_steady(baseline, after, region)
+            out['local'] = {
+                'noise': noise.get('ratio', 0.0),
+                'signal': signal.get('ratio', 0.0),
+                'steady': still.get('steady', 0.0),
+                'where': signal.get('region'),
+            }
+            # Kept as context, never as the verdict: on an animated window this is
+            # non-zero whatever the click did.
+            whole = pixels.diff(baseline[0], after)
+            out['global'] = {'ratio': whole.get('ratio', 0.0)}
     if windows_before is not None:
         appeared = [hwnd for hwnd in visible_windows() if hwnd not in windows_before]
         out['newWindows'] = [
@@ -612,14 +705,27 @@ def handle_act(payload, isolated):
     want_verify = action in ('click', 'type') and payload.get('verify') is not False
 
     anchor = None
-    before = None
+    baseline = []
+    region = None
     windows_before = None
     if want_verify:
         try:
             anchor = top_level(act_anchor(payload))
-            before = pixels.grab(anchor, True) if anchor else None
+            region = act_region(payload, anchor)
+            # Three frames spanning roughly the same span the after-shot will span:
+            # anything that differs across them is the scene's own motion and cannot be
+            # used as evidence that the click worked. Two frames is not enough — a slow
+            # edge moves less than the threshold between two captures and passes for
+            # still, which then scores a miss higher than a hit.
+            if anchor:
+                baseline.append(pixels.grab(anchor, True))
+                time.sleep(0.07)
+                baseline.append(pixels.grab(anchor, True))
+                time.sleep(0.07)
+                baseline.append(pixels.grab(anchor, True))
         except Exception:  # noqa: BLE001
-            before = None
+            baseline = []
+            region = None
         try:
             windows_before = set(visible_windows())
         except Exception:  # noqa: BLE001
@@ -627,7 +733,7 @@ def handle_act(payload, isolated):
 
     result = _act_body(payload, isolated)
     if want_verify and isinstance(result, dict):
-        result['verify'] = describe_change(anchor, before, windows_before)
+        result['verify'] = describe_change(anchor, baseline, windows_before, region)
     return result
 
 

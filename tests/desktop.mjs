@@ -87,6 +87,15 @@ try {
     const wrote = await host.act({ action: 'type', target: editor.id, text: typed }, { desktop: launched.desktop });
     if (wrote?.chars === typed.length) ok('text sent', `${wrote.via}, ${wrote.chars} chars`);
     else fail('type', JSON.stringify(wrote));
+    // The verification has to work on an ordinary window too, not just on a canvas: the
+    // editor's own rectangle is the region, so the new text is signal and the untouched
+    // area around it is noise-free.
+    const typedLocal = wrote?.verify?.local ?? {};
+    if ((Number(typedLocal.signal) || 0) > (Number(typedLocal.noise) || 0) * 2 + 0.001) {
+      ok('typing is confirmed by the pixels it changed', `signal ${((typedLocal.signal || 0) * 100).toFixed(1)}% vs noise ${((typedLocal.noise || 0) * 100).toFixed(1)}%`);
+    } else {
+      fail('type verification', JSON.stringify(wrote?.verify));
+    }
     const readBack = await host.read({ target: editor.id, desktop: launched.desktop });
     if (readBack?.text === typed) ok('the control contains exactly that', JSON.stringify(readBack.text));
     else fail('read back', JSON.stringify(readBack));

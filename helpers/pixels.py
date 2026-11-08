@@ -223,16 +223,132 @@ def draw_grid(width, height, rgb, step=100):
     return bytes(pixels)
 
 
-# --- comparison ------------------------------------------------------------
-
-def diff(before, after, sample=3, threshold=12):
+def colours(shot, step=8, ceiling=64):
     """
-    How much of the window changed between two grabs.
+    How many distinct colours a coarse sweep finds.
+
+    A GPU-composited window on a desktop nobody is looking at sometimes hands PrintWindow
+    an empty surface, and PrintWindow reports success — the failure is a picture that is
+    entirely one colour. Counting colours is what turns that into a statement instead of
+    a blank image the caller has to interpret.
+    """
+    width, height = shot['width'], shot['height']
+    rgb = shot['rgb']
+    stride = width * 3
+    seen = set()
+    for y in range(0, height, step):
+        row = y * stride
+        for x in range(0, width, step):
+            offset = row + x * 3
+            seen.add(rgb[offset:offset + 3])
+            if len(seen) >= ceiling:
+                return len(seen)
+    return len(seen)
+
+
+# --- comparison ------------------------------------------------------------   
+
+def _bounds(region, width, height):
+    if not region:
+        return 0, 0, width, height
+    x0 = max(0, int(region.get('x', 0)))
+    y0 = max(0, int(region.get('y', 0)))
+    x1 = min(width, x0 + max(1, int(region.get('width', width))))
+    y1 = min(height, y0 + max(1, int(region.get('height', height))))
+    return x0, y0, x1, y1
+
+
+def _same(a, b, offset, threshold):
+    return (
+        abs(a[offset] - b[offset]) <= threshold
+        and abs(a[offset + 1] - b[offset + 1]) <= threshold
+        and abs(a[offset + 2] - b[offset + 2]) <= threshold
+    )
+
+
+def diff_steady(pre_frames, after, region=None, sample=2, threshold=8):
+    """
+    Judge only the pixels that were already still before the action.
+
+    An animated scene differs from itself between any two frames, so a plain comparison
+    cannot separate "the click did something" from "the scene kept moving". Measured on
+    a running canvas game: a click that hit a button and a click into empty space came
+    back as 0.7% and 0.5% — the same number twice, and in the wrong order.
+
+    Pixels that were identical across *all* pre-action frames cannot be part of the
+    animation, so a change there came from the action. `steady` reports how much of the
+    region qualified: when it is small, the honest answer is that this area moves by
+    itself and pixels prove nothing — not a guess dressed up as a result.
+
+    Three frames, not two: a slow edge can move less than the threshold between two
+    captures 90ms apart and still be animating. Measured on a canvas game, two frames
+    left a ball's outline counted as steady, and a click into empty space then scored
+    higher (2.8%) than a click that hit a button (0.7%).
+    """
+    if not pre_frames:
+        return {'steady': 0.0, 'changed': 0.0, 'reason': 'no baseline frames'}
+    first = pre_frames[0]
+    width, height = first['width'], first['height']
+    for frame in pre_frames:
+        if frame['width'] != width or frame['height'] != height:
+            return {'steady': 0.0, 'changed': 0.0, 'reason': 'the window changed size during the baseline'}
+    if after['width'] != width or after['height'] != height:
+        return {'steady': 0.0, 'changed': 0.0, 'reason': 'the window changed size'}
+
+    x0, y0, x1, y1 = _bounds(region, width, height)
+    stride = width * 3
+    buffers = [frame['rgb'] for frame in pre_frames]
+    reference = buffers[-1]
+    final = after['rgb']
+
+    total = 0
+    steady = 0
+    changed = 0
+    min_x = min_y = 10 ** 9
+    max_x = max_y = -1
+    for y in range(y0, y1, sample):
+        row = y * stride
+        for x in range(x0, x1, sample):
+            offset = row + x * 3
+            total += 1
+            still = True
+            for buffer in buffers[:-1]:
+                if not _same(buffer, reference, offset, threshold):
+                    still = False
+                    break
+            if not still:
+                continue  # moving on its own, so it cannot testify
+            steady += 1
+            if not _same(reference, final, offset, threshold):
+                changed += 1
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
+
+    out = {
+        'steady': round(steady / max(1, total), 3),
+        'changed': round(changed / steady, 4) if steady else 0.0,
+        'samples': total,
+    }
+    if changed:
+        out['region'] = {'x': min_x, 'y': min_y, 'width': max_x - min_x + 1, 'height': max_y - min_y + 1}
+    return out
+
+
+def diff(before, after, sample=3, threshold=12, region=None):
+    """
+    How much changed between two grabs, optionally inside one rectangle.
 
     Sampled rather than pixel-by-pixel: the point is a yes/no signal plus roughly where,
     and a full scan of a 4K window costs more than the answer is worth. A blinking caret
-    or an animation will register as a small change — which is why the ratio and the
-    region are reported instead of a bare true/false.
+    or an animation will register as a change — which is why the ratio and the region are
+    reported instead of a bare true/false, and why callers compare it against the same
+    measurement taken with nothing happening (`noise`).
     """
     if before['width'] != after['width'] or before['height'] != after['height']:
         return {'changed': True, 'ratio': 1.0, 'reason': 'the window changed size'}
@@ -240,14 +356,15 @@ def diff(before, after, sample=3, threshold=12):
     a = before['rgb']
     b = after['rgb']
     stride = width * 3
+    x0, y0, x1, y1 = _bounds(region, width, height)
 
     total = 0
     changed = 0
     min_x = min_y = 10 ** 9
     max_x = max_y = -1
-    for y in range(0, height, sample):
+    for y in range(y0, y1, sample):
         row = y * stride
-        for x in range(0, width, sample):
+        for x in range(x0, x1, sample):
             offset = row + x * 3
             total += 1
             if (
