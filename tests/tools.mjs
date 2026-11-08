@@ -475,7 +475,16 @@ try {
     else fail('find argument check', error.message);
   }
 
-  console.log('18) browser_attach is wired and explains a dead endpoint');
+  console.log('18) clipboard refuses a write with nothing to write');
+  try {
+    await call('clipboard', { action: 'write' });
+    fail('clipboard write with no content', 'it resolved instead of throwing');
+  } catch (error) {
+    if (/needs text or a window/.test(error.message)) ok('an empty write is explained', error.message.split('.')[0].slice(0, 70));
+    else fail('clipboard argument check', error.message);
+  }
+
+  console.log('19) browser_attach is wired and explains a dead endpoint');
   try {
     await call('browser_attach', { url: 'http://127.0.0.1:9' });
     fail('attach to a dead endpoint', 'it resolved instead of throwing');

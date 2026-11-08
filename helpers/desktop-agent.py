@@ -43,6 +43,7 @@ import difflib
 
 import ocr
 import pixels
+import winclip
 
 IS_WINDOWS = sys.platform.startswith('win')
 
@@ -1220,6 +1221,74 @@ def handle(payload, isolated=None):
                 'uia': bool(api), 'uiaError': _UIA_ERROR[0] or None,
                 'ocr': ocr.available(), 'ocrLanguage': ocr.status().get('language'),
                 'ocrError': ocr.status().get('reason')}
+
+    if cmd == 'clipboard':
+        action = str(payload.get('action') or 'read').lower()
+        if action == 'read':
+            read = winclip.read()
+            result = {
+                'text': read['text'],
+                'hasText': read['hasText'],
+                'hasImage': read['hasImage'],
+                'sequence': read['sequence'],
+            }
+            if read['hasImage'] and payload.get('imagePath'):
+                try:
+                    image = winclip.read_image()
+                except Exception as error:  # noqa: BLE001 - the text is still worth returning
+                    result['imageError'] = str(error)
+                else:
+                    pixels.write_png(payload['imagePath'], image['width'], image['height'], image['rgb'])
+                    result['image'] = {
+                        'path': payload['imagePath'],
+                        'width': image['width'],
+                        'height': image['height'],
+                    }
+            return result
+        if action == 'write':
+            window_id = str(payload.get('window') or '').strip()
+            if window_id:
+                # Screenshot straight onto the clipboard: the shortest honest path from
+                # "that window" to "paste it into any other app".
+                hwnd = parse_id(window_id)
+                shot = grab_stable(hwnd, True)
+                written = winclip.write_image(shot['width'], shot['height'], shot['rgb'])
+                return {
+                    'kind': 'image',
+                    'width': written['width'],
+                    'height': written['height'],
+                    'sequence': written['sequence'],
+                }
+            if payload.get('text') is None:
+                raise RuntimeError('write needs text, or a window to capture onto the clipboard')
+            wanted = str(payload.get('text') or '')
+            wrote = winclip.write(wanted)
+            # Read it back: SetClipboardData accepting the block only means Windows took
+            # ownership of it, not that it held what we meant to put there.
+            check = winclip.read()
+            return {
+                'chars': wrote['chars'],
+                'sequence': wrote['sequence'],
+                'verified': check['text'] == wanted,
+            }
+        if action == 'writeimage':
+            import base64
+
+            width = int(payload.get('width') or 0)
+            height = int(payload.get('height') or 0)
+            if width <= 0 or height <= 0 or width * height > 4_000_000:
+                raise RuntimeError('writeImage needs a width and height, capped at 4M pixels')
+            try:
+                raw = base64.b64decode(payload.get('rgbBase64') or '')
+            except Exception as error:  # noqa: BLE001
+                raise RuntimeError('rgbBase64 is not valid base64: %s' % error)
+            if len(raw) != width * height * 3:
+                raise RuntimeError('expected %d bytes of RGB, got %d' % (width * height * 3, len(raw)))
+            written = winclip.write_image(width, height, raw)
+            return {'width': written['width'], 'height': written['height'], 'sequence': written['sequence']}
+        if action == 'clear':
+            return winclip.clear()
+        raise RuntimeError('unknown clipboard action "%s"' % action)
     if cmd == 'windows':
         desktop = isolated.name if isolated else 'user'
         return {'windows': list_windows(desktop, payload.get('process'))}
@@ -1364,7 +1433,7 @@ def main():
 
         cmd = str(payload.get('cmd') or '').lower()
         try:
-            if cmd in ('windows', 'tree', 'read', 'act', 'launch', 'shot') and payload.get('desktop'):
+            if cmd in ('windows', 'tree', 'read', 'act', 'launch', 'shot', 'clipboard') and payload.get('desktop'):
                 name = str(payload['desktop'])
                 current = isolates.get(name)
                 if not current:
