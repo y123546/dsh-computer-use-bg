@@ -4,6 +4,7 @@ import { snapshotAll } from '../lib/frames.js';
 import { clickAt, evaluate } from '../lib/page.js';
 
 const WANTED = ['dsh-armory', 'dsh-computer-use-bg'];
+const ALL = process.argv.includes('--all');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const host = new BrowserHost({ attachUrl: 'http://127.0.0.1:9333' });
 try {
@@ -45,13 +46,49 @@ try {
       return null;
     })()`);
 
-  for (const name of WANTED) {
-    let row = null;
-    for (let attempt = 0; attempt < 20 && !row; attempt += 1) {
-      row = await readRow(name);
-      if (!row) await sleep(1500);
+  if (ALL) {
+    // Walk every fiber in the plugin list once, instead of looking up two names.
+    let rows = [];
+    let previous = -1;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      rows = await evaluate(conn, `(() => {
+        const seen = new Map();
+        for (const el of document.querySelectorAll('*')) {
+          const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+          if (!key) continue;
+          let fiber = el[key];
+          for (let u = 0; u < 14 && fiber; u += 1) {
+            const pkg = fiber.memoizedProps && fiber.memoizedProps.pkg;
+            if (pkg && pkg.name && !seen.has(pkg.name)) {
+              seen.set(pkg.name, {
+                name: pkg.name,
+                version: pkg.version,
+                enabled: pkg.enabled,
+                error: pkg.error === undefined ? null : String(pkg.error),
+                phases: (pkg.rows || []).map((row) => row.phase),
+              });
+            }
+            fiber = fiber.return;
+          }
+        }
+        return [...seen.values()];
+      })()`);
+      if (rows.length > 0 && rows.length === previous) break;
+      previous = rows.length;
+      await sleep(1500);
     }
-    console.log(`${name}:`, row ? JSON.stringify(row) : 'row not found');
+    rows.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    for (const row of rows) console.log(`${row.name}: ${JSON.stringify(row)}`);
+    console.log(`total rows: ${rows.length}`);
+  } else {
+    for (const name of WANTED) {
+      let row = null;
+      for (let attempt = 0; attempt < 20 && !row; attempt += 1) {
+        row = await readRow(name);
+        if (!row) await sleep(1500);
+      }
+      console.log(`${name}:`, row ? JSON.stringify(row) : 'row not found');
+    }
   }
 } catch (error) {
   console.log('ERROR', error.message);
